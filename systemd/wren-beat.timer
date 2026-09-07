@@ -1,0 +1,25 @@
+# Derived from packages/purse/systemd/heron-beat.timer (Heron's) at weir main bfc070e, renamed for Wren; the history in these comments is Heron's.
+# Built-by: @projectx.sui · Co-authored-by: Kaela <kaela@projectxprotocol.dev>
+#
+# Every thirty minutes. Enabled only after the deploy has run one beat by hand and asserted its
+# state file, its exit code and the container's digest — v1 enabled a timer against a home nobody
+# had proved.
+
+[Unit]
+Description=Wren — beat every 30 minutes
+Documentation=file:///srv/wren/purse/README.md
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=30min
+# Two droplets asking a public fullnode on the same second is a self-inflicted rate limit.
+RandomizedDelaySec=60
+# A beat missed because the host was down runs on the next boot instead of being skipped. Without
+# this, a reboot inside a tick silently loses a beat and the 90-minute dead man is the first thing
+# that notices.
+Persistent=true
+AccuracySec=1min
+Unit=wren-beat.service
+
+[Install]
+WantedBy=timers.target

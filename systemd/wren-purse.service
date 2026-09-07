@@ -1,0 +1,139 @@
+# Derived from packages/purse/systemd/heron-purse.service (Heron's) at weir main bfc070e, renamed for Wren; the history in these comments is Heron's.
+# Built-by: @projectx.sui · Co-authored-by: Kaela <kaela@projectxprotocol.dev>
+#
+# The only process on this host that holds Wren's hot key.
+#
+# It is reached over one unix socket, answers one call, and returns a signature or a refusal. The
+# container that runs the model cannot reach this unit's credential directory, its state directory
+# or its audit log; it is given the socket and nothing else.
+#
+# The <PLACEHOLDER> values are filled by packages/agent-runtime/digitalocean/deploy-droplet.sh
+# --install-purse, which prints every one of them before it ships anything. They are not defaults: a unit with a wrong policy hash
+# refuses to start, which is the intended behaviour of a half-finished deploy.
+
+[Unit]
+Description=Wren purse — hot-key signer behind the policy
+Documentation=file:///srv/wren/purse/README.md
+After=network-online.target
+Wants=network-online.target
+# The socket must exist before the first beat. See wren-beat.service's After=.
+Before=wren-beat.service
+
+[Service]
+Type=notify
+# systemd-notify is a CHILD of the node process, not the main process, because node cannot open an
+# AF_UNIX SOCK_DGRAM socket and so cannot send the readiness datagram itself. NotifyAccess=all is
+# what lets a child notify; this unit's cgroup holds the purse and its children and nothing else.
+NotifyAccess=all
+
+# The uid ruling, written here because systemd has no directive that carries one.
+#
+# `wren` is uid/gid 10001 and `purse` is uid/gid 10002, both fixed and both asserted free before
+# they are created. v1's defect 3 was a dynamically allocated uid that collided with DigitalOcean's
+# own `do-agent` at 999; 10001 and 10002 sit above the whole range Debian's tooling allocates from.
+# `wren` owns the model's workspace and the container runs as it; `purse` owns the key, the socket
+# and the audit chain, and the two must never be the same account.
+#
+# The deploy creates this one as:
+#
+#   getent passwd 10002 || getent group 10002   # must BOTH be empty, or refuse
+#   groupadd --gid 10002 --system purse
+#   useradd --uid 10002 --gid 10002 --system --no-create-home --shell /usr/sbin/nologin purse
+#   getent passwd 10002 | cut -d: -f1           # must read `purse`, or refuse
+#
+# — the same empty-before / resolves-after pair the container's Dockerfile already runs for 10001,
+# because a uid that silently resolves to somebody else is how a hardened unit ends up running as
+# a service account that already had a shell. `test/units.test.ts` asserts these numbers here and
+# in README.md so the deploy has one place to copy from and drift fails a test, not a droplet.
+User=purse
+Group=purse
+
+# The hot key. systemd decrypts the blob — which is sealed to this host and worthless off it — into
+# a per-unit tmpfs at 0400 owned by purse, and unmounts it when the unit stops. Nothing plaintext is
+# ever written to /srv/wren.
+LoadCredentialEncrypted=wren-hot:/etc/wren/creds/wren-hot.cred
+
+# WHY THERE IS NO --jitless AND NO MemoryDenyWriteExecute HERE ANY MORE (2026-09-06).
+#
+# The pair was the W^X posture: MemoryDenyWriteExecute refuses writable-and-executable memory, and
+# --jitless keeps V8 from needing any. --jitless also switches WebAssembly off, and on node 22 the
+# HTTP stack (undici) compiles its parser to WebAssembly the moment any fetch-family global is
+# touched -- Headers included, which the Sui gRPC-web transport constructs for every call. So the
+# purse could sign a publish statement (no network) and died on its first priced post (a simulate
+# over the network): Wren, 2026-09-06 04:48 UTC, `ReferenceError: WebAssembly is not defined`,
+# restart loop, beat refused. A transport on node:https was tried and died the same way, because
+# the crash is in the global's loader, not in the request. There is no HTTP client for this process
+# under --jitless on node 22. The unit's own rule was that the two directives go together or not at
+# all, and the CISO is told; the rest of the hardening set below is unchanged.
+# Two pins before the process starts, both root-owned facts in this unit: the compiled server and
+# the members document must hash to what the deploy shipped. The policy carries its own pin as an
+# argument below. Node is /opt/node22: @mysten/sui requires node 22 and Debian 13 ships 20, so the
+# deploy installs the official 22 build under /opt from a checksum it holds as a literal.
+# echo, not printf: systemd expands %s (the user's shell) inside a unit, and the first real start
+# on the host (2026-09-05) fed sha256sum a line with /usr/sbin/nologin in it.
+ExecStartPre=/bin/sh -c 'echo "<DIST_SHA256>  /srv/wren/purse/dist/server.js" | sha256sum --check --status'
+ExecStartPre=/bin/sh -c 'echo "<MULTISIG_SHA256>  /srv/wren/policy/wren-multisig.json" | sha256sum --check --status'
+ExecStart=/opt/node22/bin/node /srv/wren/purse/dist/server.js \
+  --agent wren \
+  --socket /run/wren/purse.sock \
+  --policy /srv/wren/policy/wren-policy.json \
+  --policy-sha256 <POLICY_SHA256> \
+  --multisig /srv/wren/policy/wren-multisig.json \
+  --api-origin https://weir.social \
+  --statements-per-day 96 \
+  --vault <VAULT_ID> \
+  --chain /srv/wren/chain.json \
+  --audit /var/lib/wren/audit/audit.jsonl \
+  --spend /var/lib/wren/audit/spend.jsonl
+
+# /run/wren, owned by purse, mode 0750 — the socket itself is chmod 0660 by the purse so the beat's
+# group can speak to it.
+RuntimeDirectory=wren
+RuntimeDirectoryMode=0750
+# /var/lib/wren, where the audit chain lives. 0700: the chain is the purse's, and the desk pulls it
+# over SSH as root.
+StateDirectory=wren
+StateDirectoryMode=0700
+
+Restart=on-failure
+RestartSec=5s
+
+# The hardening set, CISO §2.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# AF_UNIX for the socket; AF_INET and AF_INET6 for the outbound 443 the simulation needs against a
+# fullnode. Nothing else — no AF_NETLINK, no AF_PACKET.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# The rest of the set, not named in §2 but implied by it: a signer has no business creating user
+# namespaces, changing its own realtime priority, loading kernel modules or writing to /sys.
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectProc=invisible
+ProcSubset=pid
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+# 512 MB host, no swap, and the Docker daemon lives here too.
+MemoryMax=192M
+TasksMax=64
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

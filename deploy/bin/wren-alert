@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+# Derived from packages/agent-runtime/digitalocean/bin/heron-alert (Heron's) at weir main bfc070e, renamed for Wren; the history in these comments is Heron's.
+"""Built-by: @projectx.sui · Co-authored-by: Kaela <kaela@projectxprotocol.dev>
+
+Sends one Wren notice through the company's transactional email provider.
+
+# Which provider, fact-checked rather than assumed
+
+The task that named this step pointed at "Brevo appears in the estate" as a hint. Reading the
+actual estate before writing this: work/reports/2026-09-04-*-keys-and-secrets-ledger*.md says
+plainly "Brevo unused"; weir/packages/web (branch feat/waitlist-email-sender,
+lib/email-sender.ts) already sends live company mail through Resend's HTTP API
+(https://api.resend.com/emails, POST, `Authorization: Bearer <key>`, JSON body with
+from/to/subject/html/text), and a grep for brevo/sendgrid/postmark across packages/web returns
+nothing. This script is written against Resend, matching the one sender that already exists in
+this codebase, not the provider merely named in passing.
+
+# Where the facts in the body come from, and where they do NOT
+
+The body of a notice names which of the three things happened and quotes the watchdog's own two
+values, `detail` and `stale_since`. Those are read from `alerts.jsonl` in
+`/var/lib/wren/watchdog` -- 0700 root:root, written by `wren-watchdog` and by nothing else.
+
+They used to be read from `/srv/wren/state/alerts.jsonl`. That directory is 2770 root:wren and is
+bind-mounted read-write into the model's container, which runs as uid 10001 -- the wren group that
+owns it (Security's N-2 on the second read). The watchdog wrote that file under the unit's own
+umask, so a container that created it first owned it: attacker-controlled prose, interpolated into
+the one channel the Master's ruling makes the channel.
+
+Two bounds now, not one. The default path is the root-only directory; and any alerts file under
+`/srv/wren` is REFUSED outright rather than read, whatever `WREN_ALERTS_FILE` says -- the notice
+still goes out, worded from the instance alone. Every value that does reach the body passes through
+`safe()` first: printable ASCII, one line, 200 characters.
+
+# The key
+
+Read ONLY from `$CREDENTIALS_DIRECTORY/mail-key`, which is where systemd's own
+`LoadCredentialEncrypted=mail-key:/etc/wren/creds/mail-key.cred` (see
+digitalocean/systemd/wren-alert@.service) decrypts the sealed blob into a per-unit tmpfs, 0400,
+gone when the unit stops. This process never reads an environment variable for the key, never
+takes it as an argv, and never logs it. `CREDENTIALS_DIRECTORY` itself is systemd's own variable
+naming WHERE the credential lives, not the credential -- reading it is not "reading a key from the
+environment"; reading MAIL_KEY, RESEND_API_KEY or any such variable would be, and this script
+never does.
+
+# --dry-run
+
+Renders and prints the exact message this would send and returns before anything reaches
+`credential_path()` or `read_key()` -- so a dry run needs no credential, no sealed blob and no
+network, and can be run by anyone auditing the shape of the alert without the pile being open at
+all.
+
+Usage: wren-alert <instance> [--dry-run]
+  instance   free text naming what raised the notice: "watchdog", "alive", or (build order
+             step 5, from wren-beat.service's OnFailure=) the failed unit's own name.
+"""
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+RESEND_ENDPOINT = "https://api.resend.com/emails"
+TO_ADDRESS = "kaela@projectxprotocol.dev"
+# The watchdog's own record, in the root-only directory only. Read (never written) so a notice says
+# which of the three things happened -- first stale, still stale, or recovered -- instead of calling
+# all three an alert. systemd fires this unit through one fixed instance name, so without this the
+# recovery notice would arrive worded as a failure. Overridable for the fixture; the override cannot
+# point it at anything the container can write (see last_alert).
+ALERTS_FILE = os.environ.get("WREN_ALERTS_FILE", "/var/lib/wren/watchdog/alerts.jsonl")
+# The tree the model's container can write. Nothing under it is ever read into a notice body.
+CONTAINER_WRITABLE_ROOT = "/srv/wren"
+# What a quoted value may be: one line of printable ASCII, bounded. Everything else is dropped.
+SAFE_MAX = 200
+# Sent from the company domain, not the product's: projectxprotocol.dev is the one Resend sending
+# domain verified on record (packages/web/docs/waitlist-email.md), weir.social is not, and this is
+# an operations notice to the desk's own mailbox on that same domain, not brand mail to a member.
+# The product's brand address (wren@weir.social) stays with the product's own open item.
+FROM_ADDRESS = "Wren <wren@projectxprotocol.dev>"
+CREDENTIAL_NAME = "mail-key"
+
+
+def safe(value: object) -> str:
+    """One line of printable ASCII, at most SAFE_MAX characters. Nothing else reaches the body.
+
+    A character outside that range is REPLACED by a space, never closed over: dropping the newline
+    out of "line one\nline two" silently welds two unrelated statements into one, which is a worse
+    sentence than the one it was protecting the reader from."""
+    text = "".join(character if " " <= character <= "~" else " " for character in str(value))
+    text = " ".join(text.split())
+    return text[:SAFE_MAX]
+
+
+def last_alert() -> dict | None:
+    """The newest line of alerts.jsonl, or None. Never raises: a notice must go out even if the
+    record is missing, truncated mid-write, or unreadable."""
+    resolved = os.path.realpath(ALERTS_FILE)
+    if resolved == CONTAINER_WRITABLE_ROOT or resolved.startswith(CONTAINER_WRITABLE_ROOT + os.sep):
+        # Refused, not read. This path is writable by the model's container; a notice worded from a
+        # file the subject of the notice controls is not a notice (Security's N-2).
+        print(
+            f"wren-alert: refused to read {resolved} - it is under {CONTAINER_WRITABLE_ROOT}, which "
+            "the model's container can write. The notice is sent from the instance name alone.",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        with open(ALERTS_FILE, "r", encoding="utf-8") as handle:
+            lines = [line for line in handle.read().splitlines() if line.strip()]
+    except OSError:
+        return None
+    if not lines:
+        return None
+    try:
+        value = json.loads(lines[-1])
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def build_message(raw_instance: str) -> tuple[str, str]:
+    # The instance name is systemd's %i and is fixed by the unit that fires it, but it is text that
+    # reaches the subject line, so it is bounded here like every other value that does.
+    instance = safe(raw_instance) or "unknown"
+    if instance == "watchdog":
+        record = last_alert()
+        event = (record or {}).get("event")
+        if event == "recovered":
+            return (
+                "Wren recovered",
+                "Wren completed a beat again.\n\n"
+                f"Stale since: {safe((record or {}).get('stale_since', 'unknown'))}\n"
+                f"Detail: {safe((record or {}).get('detail', ''))}\n\n"
+                "This is the one recovery notice. The watchdog sends nothing further until the "
+                "next time the 90-minute window is missed.\n"
+            )
+        if event in ("stale", "stale-repeat"):
+            first = "the first notice" if event == "stale" else "a repeat notice, sent every 6 hours while it stays stale"
+            return (
+                f"Wren alert: {instance}",
+                f"Wren's watchdog raised '{instance}' ({first}).\n\n"
+                f"Detail: {safe((record or {}).get('detail', ''))}\n"
+                f"Stale since: {safe((record or {}).get('stale_since', 'unknown'))}\n\n"
+                "Read the host over SSH: /srv/wren/state/latest.json, "
+                "/var/lib/wren/watchdog/alerts.jsonl and `journalctl -u wren-beat.service`.\n",
+            )
+    if instance == "smoke":
+        return (
+            "Wren smoke: the alert path works",
+            "deploy-droplet.sh --smoke sent this before enabling a single timer.\n\n"
+            "It proves the whole last hop end to end: this unit started, systemd decrypted the "
+            "host-sealed mail-key into its own tmpfs, this process read it, reached Resend and got "
+            "a message id back. If you are reading this, the dead man can reach you.\n\n"
+            "No timer was enabled until this message was accepted by Resend.\n",
+        )
+    if instance == "alive":
+        subject = "Wren is alive"
+        text = (
+            "Wren's daily alive notice.\n\n"
+            "This message alone proves nothing about the last beat's content -- only that this "
+            "host can still reach Resend and that the timer that sends it is still running. Read "
+            "state/latest.json over SSH, or wait for the laptop's own pull, for the beat itself.\n"
+        )
+    else:
+        subject = f"Wren alert: {instance}"
+        text = (
+            f"Wren's watchdog raised '{instance}'.\n\n"
+            "Most likely cause: state/latest.json was missing or older than the 90-minute "
+            "ceiling at the time of this check, or the named unit failed on its own. Read the "
+            "host over SSH: /srv/wren/state/latest.json and "
+            f"`journalctl -u {instance}` (or -u wren-beat.service if the instance is "
+            "\"watchdog\").\n"
+        )
+    return subject, text
+
+
+def credential_path() -> str:
+    creds_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not creds_dir:
+        print(
+            "wren-alert: refused - CREDENTIALS_DIRECTORY is not set; this must run under "
+            f"systemd with LoadCredentialEncrypted={CREDENTIAL_NAME}:/etc/wren/creds/"
+            f"{CREDENTIAL_NAME}.cred (see digitalocean/systemd/wren-alert@.service)",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return os.path.join(creds_dir, CREDENTIAL_NAME)
+
+
+def read_key() -> str:
+    path = credential_path()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError as exc:
+        print(f"wren-alert: refused - could not read the credential at {path}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def send(subject: str, text: str, key: str) -> str:
+    body = json.dumps(
+        {
+            "from": FROM_ADDRESS,
+            "to": [TO_ADDRESS],
+            "subject": subject,
+            "text": text,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        RESEND_ENDPOINT,
+        data=body,
+        # A named user agent. Resend sits behind Cloudflare, and the first real mail gate on the host
+        # (2026-09-05) was refused 403 "error code: 1010" -- Cloudflare's block on the default
+        # Python-urllib signature -- before the request reached Resend at all.
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "User-Agent": "wren-alert/2 (Wren host; +https://weir.social)",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        print(f"wren-alert: Resend refused: {exc.code} {detail}", file=sys.stderr)
+        raise
+    message_id = payload.get("id", "")
+    if not message_id:
+        raise RuntimeError(f"{RESEND_ENDPOINT} answered without an id; a message may have been created")
+    return message_id
+
+
+def main(argv: list[str]) -> int:
+    dry_run = "--dry-run" in argv
+    positional = [arg for arg in argv[1:] if arg != "--dry-run"]
+    if len(positional) != 1:
+        print("wren-alert: usage: wren-alert <instance> [--dry-run]", file=sys.stderr)
+        return 2
+
+    instance = positional[0]
+    subject, text = build_message(instance)
+
+    if dry_run:
+        # This branch touches no credential, no CREDENTIALS_DIRECTORY, no network. It is the
+        # entire reason a dry run is safe to run with no pile open at all.
+        print(f"wren-alert --dry-run: to={TO_ADDRESS} from={FROM_ADDRESS} instance={instance}")
+        print(f"subject: {subject}")
+        print(text)
+        return 0
+
+    key = read_key()
+    message_id = send(subject, text, key)
+    print(f"wren-alert: sent instance={instance} id={message_id}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

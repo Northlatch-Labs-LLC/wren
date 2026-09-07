@@ -1,0 +1,90 @@
+# Built-by: @projectx.sui · Co-authored-by: Kaela <kaela@projectxprotocol.dev>
+#
+# One settlement. Closes the epoch that ended, books what it earned and what it cost, and settles.
+#
+# Exit 4 means the run refused because that settlement would have retired Wren: two consecutive
+# critical epochs retires a soul inside settle_epoch itself, with no second signature. The refusal
+# is deliberate and it is not a failure of this unit, so it is listed as a success exit status —
+# a red unit on a night nobody is watching would train the operator to ignore it. The journal line
+# says exactly what the vault held and what the allowance was.
+
+[Unit]
+Description=Wren — settle the soul's epoch
+Documentation=file:///srv/wren/purse/README.md
+After=wren-ledger-purse.service
+Requires=wren-ledger-purse.service
+
+[Service]
+Type=oneshot
+# Runs AS ledger, not as root.
+#
+# It was root, on the reasoning that wren-beat.service runs as root and the socket is 0660
+# ledger:ledger. That reasoning was wrong here, and the host said so: this unit sets
+# CapabilityBoundingSet= (empty), so its root has no CAP_DAC_OVERRIDE and no CAP_DAC_READ_SEARCH.
+# Root by name, with none of the powers that let root ignore file modes. /srv/wren-ledger is
+# 0750 ledger:ledger, so the process could not traverse into its own program and node reported
+# MODULE_NOT_FOUND on a file that was plainly there and readable to a root shell.
+#
+# The fix is the owner, not a capability. This process needs exactly three things — read
+# /srv/wren-ledger, write /var/lib/wren-ledger/state, speak to a socket that is 0660
+# ledger:ledger — and the ledger account has all three by ownership. Granting CAP_DAC_OVERRIDE
+# back would have worked and would have handed a settlement run the power to read every file on
+# the host, to fix a permission it already had by another name.
+User=ledger
+Group=ledger
+SuccessExitStatus=4
+
+ExecStart=/opt/node22/bin/node /srv/wren-ledger/dist/ledger-tick.js \
+  --agent wren \
+  --chain /srv/wren-ledger/chain.json \
+  --socket /run/wren-ledger/purse.sock \
+  --graphql https://graphql.mainnet.sui.io/graphql \
+  --package <SOUL_PACKAGE_ID> \
+  --registry <SOUL_REGISTRY_ID> \
+  --registry-version <SOUL_REGISTRY_VERSION> \
+  --soul <WREN_SOUL_ID> \
+  --soul-version <WREN_SOUL_VERSION> \
+  --vault <WREN_VAULT_ID> \
+  --ledger-cap <LEDGER_CAP_ID> \
+  --ledger-cap-version <LEDGER_CAP_VERSION> \
+  --ledger-cap-digest <LEDGER_CAP_DIGEST> \
+  --clock 0x0000000000000000000000000000000000000000000000000000000000000006 \
+  --clock-version 1 \
+  --burn-per-epoch-mist <WREN_BURN_PER_EPOCH_MIST> \
+  --state /var/lib/wren-ledger/state/ledger.json
+
+# --allow-retire is deliberately absent. Adding it here is the operator saying, in writing and in a
+# file under version control, that this timer may end a citizen unattended.
+
+StateDirectory=wren-ledger
+StateDirectoryMode=0700
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectProc=invisible
+ProcSubset=pid
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+MemoryMax=128M
+TasksMax=32
+
+StandardOutput=journal
+StandardError=journal

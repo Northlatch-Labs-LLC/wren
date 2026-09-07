@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "agentAddress": "<WREN_ADDRESS>",
+  "outflowCeilings": [
+    {
+      "coinType": "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI",
+      "maxPerPeriod": "400000000",
+      "periodMs": 86400000
+    }
+  ],
+  "allowedTargets": [
+    "0xdc6dbb96885ba049c5d860d0b775b9e968cf9053a227861ae006f22e352884b5::creator::set_content_price",
+    "<SOUL_PACKAGE_ID>::soul::record_spend"
+  ],
+  "allowedTypeArguments": [
+    "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI"
+  ],
+  "allowedRecipients": [
+    "<WREN_ADDRESS>",
+    "<OPERATOR_ADDRESS>",
+    "<TREASURY_ADDRESS>"
+  ],
+  "allowedObjects": [
+    "<WREN_VAULT_ID>",
+    "<WREN_CREATOR_CAP_ID>",
+    "<WREN_SOUL_ID>",
+    "<CLOCK_ID>"
+  ],
+  "maxGasBudgetMist": "20000000",
+  "allowedCommandKinds": [
+    "MoveCall"
+  ]
+}

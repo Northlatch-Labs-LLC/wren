@@ -1,0 +1,74 @@
+# Derived from packages/agent-runtime/run-flags.txt (Heron's) at weir main bfc070e, renamed for Wren; the history in these comments is Heron's.
+# Built-by: @projectx.sui · Co-authored-by: Kaela <kaela@projectxprotocol.dev>
+#
+# The run-flag set for the wren image, read by the v2 host's launcher (built at build order
+# step 6/9). One flag (or flag plus its value) per line; blank lines and lines starting with `#`
+# are ignored. test/image.test.mjs asserts every REQUIRED flag below is present verbatim in this
+# file, so the launcher and the test cannot drift from each other.
+#
+# Source: CTO spec 2026-09-05-engineering-heron-v2-runtime-and-host.md §2.6 §2.8, narrowed for
+# this step: the purse signer and its socket do not exist yet (build order step 5), so no socket
+# is listed here — a mount to a path nothing serves is not a security control, it is a lie. The
+# flag set below is added to, not weakened, once the signer exists.
+
+--rm
+--pull=never
+--network bridge
+--read-only
+--tmpfs /tmp:rw,noexec,nosuid,size=64m
+--cap-drop=ALL
+--security-opt no-new-privileges
+--pids-limit 128
+--memory 384m
+--memory-swap 384m
+--cpus 0.9
+--user 10001:10001
+
+# Mounts. Only these three; nothing else is bind-mounted into the container.
+#   host path (owner:mode)              container path        mode
+#   /srv/wren/runs        (wren:2770) -> /app/runs           rw   (beat logs AND the intent: runs/<beat-id>/intent.json)
+#   /srv/wren/state       (wren:2770) -> /app/state          rw   (state/latest.json, state/beats.jsonl — the heartbeat sink, spec §3.10)
+#   /srv/wren/image.env   (root:0600)  -> /app/image.env      ro   (the pinned config the container reads, never writes)
+#
+# ONE intent path, and it is under runs/. The contract is packages/purse/src/beat.ts's
+# `join(runsDir, beatId, INTENT_FILE)` — `runs/<beat-id>/intent.json` — which is what
+# packages/purse/bin/beat-phase2.ts actually reads and what packages/purse/systemd/wren-beat.service
+# documents. A fourth writable mount at /srv/wren/intents was carried here and created by
+# cloud-init while NOTHING read it: surface into the model's container for a handoff that happens
+# somewhere else (Security's A6 on step 6). It is removed from this file and from cloud-init in the
+# same change, and test/host-fixes.test.mjs asserts all four artefacts still agree.
+--mount type=bind,source=/srv/wren/runs,target=/app/runs,readonly=false
+--mount type=bind,source=/srv/wren/state,target=/app/state,readonly=false
+--mount type=bind,source=/srv/wren/image.env,target=/app/image.env,readonly=true
+
+# What is never mounted, on purpose, at this step and at every step after it:
+#   - NOTHING under /var/lib/wren, and /var/lib/wren/watchdog least of all. That directory is
+#     0700 root:root and holds the dead man's own memory: wren-watchdog's alerts.jsonl and its
+#     `degraded` marker. They used to live in /srv/wren/state, which the line above mounts
+#     read-write into this container as uid 10001 -- the wren group that owns it -- so the model
+#     could write a marker with a far-future `last_notified` and permanently silence the watchdog
+#     watching it, and could create alerts.jsonl first and choose the text of the Master's email
+#     (Security's N-1 and N-2 on the second read of step 6). The subject of a notice does not get
+#     to write the notice.
+#   - no key file of any kind (the hot key, the brake key's public half, the model key)
+#   - no key material as an environment variable (a key in ps/argv/env is not "secured")
+#   - no signer socket, ever: decision 3 and Security's spec §2 say the container never gets a
+#     key and never gets the signer's socket; the beat is two phases and the container only
+#     writes an intent file. This line is fixed, not a placeholder (Security's A6).
+
+# What the host launcher (digitalocean/bin/wren-beat) ADDS per beat, beyond this fixed set, and
+# says here so the two cannot be read apart:
+#   --mount type=bind,source=/run/wren-beat/cfg,target=/app/config,readonly=true
+#       the beat's rendered config.json, its .security.yml, and the model credential as
+#       openrouter.token, all 0400 owned by uid 10001, in the unit's own RuntimeDirectory on the
+#       host's tmpfs; created for this beat, removed by systemd when the unit stops. This is the
+#       one way the decrypted model credential reaches PicoClaw (wren-beat.service's
+#       LoadCredentialEncrypted=, decrypted for the life of one beat, never under /srv/wren).
+#       bin/beat.sh then spawns PicoClaw under `env -i` with the allow-list only, so no stdio
+#       child of the model inherits a variable naming it.
+#   -e PICOCLAW_CONFIG=/app/config/config.json
+#   -e WEIR_AGENT_WORKSPACE=/app/runs/<beat-id>   the model's workspace IS the beat directory, so
+#                                                  an intent lands at runs/<beat-id>/intent.json
+#   -e WEIR_AGENT_RUNS_DIR=/app/runs/<beat-id>     the container's own log beside it
+#   --name wren-beat-<beat-id>
+# The image is run by its pinned id from /srv/wren/image.env, never by tag.

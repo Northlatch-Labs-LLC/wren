@@ -1,0 +1,319 @@
+#cloud-config
+# Derived from packages/agent-runtime/digitalocean/cloud-init.yaml (Heron's) at weir main bfc070e, renamed for Wren; the history in these comments is Heron's.
+# ASCII ONLY. Heron v1 was scrapped in part because one U+0080 byte in a comment made PyYAML
+# refuse the whole document ("unacceptable character #x0080"), cloud-init applied NOTHING, and the
+# droplet booted bare with root reachable. scripts/check-ascii.py refuses the RENDERED copy of this
+# file (after the SSH key placeholder below is substituted) before deploy-droplet.sh ever calls
+# the API. Do not
+# paste a smart quote, an em dash or any other non-ASCII character into this file, ever.
+#
+# Build order step 6 (work/rnd/agent/2026-09-05-executive-heron-v2-decided.md section 3), against
+# the CTO's spec (2026-09-05-engineering-heron-v2-runtime-and-host.md sections 3, 5) and the CISO's
+# spec, amended by the executive to one host for a 1-of-2 multisig (one signer service,
+# wren-purse; the LedgerCap service also runs here). This file sets up the OS only: users, SSH
+# hardening, packages, the resolver path, the /srv/wren, /var/lib/wren and /etc/wren/creds
+# layout, and the wren system group/user
+# that both the host's own units and the container's fixed uid 10001 read and write through. No
+# timer is enabled here -- deploy-droplet.sh --smoke proves one real beat works before any timer
+# is turned on, and wren-beat.service/.timer/wren-purse.service (build order step 5) and the
+# actual key material (step 8) are placed later, over the same SSH session, never in this file.
+#
+# No key of any kind is ever written by this file. The mail-key credential the alert units read is
+# sealed onto this host afterward, by deploy-droplet.sh --seal, straight into
+# systemd-creds encrypt --with-key=host -- never as a plaintext file, never inline here.
+package_update: true
+package_upgrade: true
+# DigitalOcean injects vendor data that installs its own agent at first boot; on the second real
+# run (2026-09-05) that installer and ours fought over the apt lock and both failed. No platform
+# installer runs on this host at all.
+vendor_data:
+  enabled: false
+# iptables is listed because Docker's bridge NAT needs it: on the fifth real run (2026-09-05) the
+# host reached the mirrors but containers could not (a connection timeout to deb.debian.org:80),
+# the signature of a bridge with no masquerade. The packages are installed by the first runcmd entry below, with a lock wait and retries,
+# instead of the packages: module, so a transient apt failure is retried and named rather than
+# fatal and silent (the second real run failed here with exit 100 and no stderr).
+disable_root: true
+ssh_pwauth: false
+# One door, one key. v1's second shell account (wren-ops) carried the SAME public key as `ops`
+# and was used by nothing -- two doors, one key, and only one of them ever asserted. Security's
+# note N1 on this step: it is removed here rather than kept "in case".
+#
+# `ops` holds NOPASSWD:ALL, which is said plainly rather than implied: the desk's SSH key IS root
+# on this host. disable_root:true bounds the direct-root path only. The bound that matters is the
+# firewall (22 from the desk's address alone) and the key living in the Master's own agent.
+users:
+  - name: ops
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - "SSH_PUBLIC_KEY"
+write_files:
+  # Sorts BEFORE cloud-init's own 50-cloud-init.conf (Debian's sshd_config includes
+  # sshd_config.d/*.conf in glob order and sshd keeps the FIRST value it reads for a keyword) --
+  # v1 named this file 99-wren.conf, which sorts AFTER 50-cloud-init.conf and lost every keyword.
+  # Asserted, not assumed: deploy-droplet.sh's post-boot check runs
+  # `sshd -T | grep -E '^(passwordauthentication|permitrootlogin|kbdinteractiveauthentication) no$'`
+  # over SSH and destroys the droplet if any of the three does not read "no".
+  - path: /etc/ssh/sshd_config.d/00-wren.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin no
+      KbdInteractiveAuthentication no
+  # Automatic-Reboot left at its Debian default (unset, which unattended-upgrades treats as false)
+  # would already be safe; this file makes the choice explicit and load-bearing rather than
+  # incidental, because an unannounced reboot mid-beat is a false dead-man alert (CTO spec 3.13).
+  # Reboots stay the desk's call, read from the pending list over SSH.
+  # Installing unattended-upgrades is not enabling it (Security's note N3 on this step): the
+  # package's own default file may or may not carry these periodic keys, and nothing here read
+  # them back. This file sets both explicitly and runcmd below asserts them out of
+  # `apt-config dump`, which is the merged view of every file in apt.conf.d -- so the assertion
+  # fails loudly if some later file turns them off again.
+  - path: /etc/apt/apt.conf.d/20auto-upgrades
+    permissions: "0644"
+    owner: root:root
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+  # logrotate cannot rotate the systemd journal -- journald bounds itself, and nothing set a bound
+  # (CTO spec 3.12, Security note N7). 200 MB on a 10 GB disk, with the runtime (tmpfs) copy small
+  # enough that a 512 MB host does not spend its memory on logs.
+  - path: /etc/systemd/journald.conf.d/00-wren.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Journal]
+      SystemMaxUse=200M
+      RuntimeMaxUse=32M
+      MaxRetentionSec=1month
+  - path: /etc/apt/apt.conf.d/51-wren-no-automatic-reboot
+    permissions: "0644"
+    owner: root:root
+    content: |
+      Unattended-Upgrade::Automatic-Reboot "false";
+runcmd:
+  - - sh
+    - -c
+    - |
+      set -e
+      for i in 1 2 3 4 5; do
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do sleep 3; done
+        if DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confold -y -q install docker.io iptables ca-certificates logrotate unattended-upgrades python3 nodejs; then echo "wren: packages installed on attempt $i"; exit 0; fi
+        echo "wren: apt install attempt $i failed; updating and retrying" >&2; sleep 10; apt-get -q update || true
+      done
+      echo "wren: package install failed after 5 attempts" >&2; exit 1
+  # sshd is not restarted by cloud-init's own module when only write_files touched its config
+  # directory; restart explicitly so 00-wren.conf takes effect in this boot, not the next one.
+  - [ systemctl, restart, ssh ]
+  # Same reason, for the journal bound written above.
+  - [ systemctl, restart, systemd-journald ]
+
+  # DigitalOcean's own monitoring agent (do-agent) is what v1 collided with at uid 999: the
+  # droplet is created with monitoring:false (deploy-droplet.sh), which should mean do-agent is
+  # never installed at all, but this purges it defensively in case a base image ever ships it
+  # pre-installed or a future create call regresses the flag. "|| true" because the normal case is
+  # that neither command finds anything to remove.
+  - "apt-get purge -y do-agent || true"
+  - "deluser --remove-home do-agent || true"
+
+  # Empirical assertion before the fact, not reasoning alone: Debian Policy 9.2.2 puts system
+  # accounts at 100-999 and dynamic login accounts starting at 1000 (adduser.conf FIRST_UID), so
+  # 10001 should be free on a clean Debian 13 image -- but v1's uid 999 collision was exactly this
+  # kind of assumption going unchecked. If either id is already taken, cloud-init fails this boot
+  # loudly (runcmd errors mark cloud-init's own run as failed, which deploy-droplet.sh's
+  # `cloud-init status --wait --long` check catches) rather than silently reusing someone else's id.
+  - |
+    if getent passwd 10001 >/dev/null 2>&1; then
+      echo "wren cloud-init: refused - uid 10001 already exists before the wren group/user is created" >&2
+      exit 1
+    fi
+    if getent group 10001 >/dev/null 2>&1; then
+      echo "wren cloud-init: refused - gid 10001 already exists before the wren group/user is created" >&2
+      exit 1
+    fi
+  # The group is created FIRST, as its own step, matching the container's own uid/gid 10001:10001
+  # (Dockerfile, build order step 3) -- so a beat's writes under runs/ and state/, the container's
+  # only two writable mounts, land group-owned by the same id the container runs as, on a host
+  # account that owns nothing else.
+  - [ groupadd, --gid, "10001", wren ]
+  - [ useradd, --uid, "10001", --gid, "10001", --system, --no-create-home, --home-dir, /nonexistent, --shell, /usr/sbin/nologin, wren ]
+  - |
+    RESOLVED_USER="$(getent passwd 10001 | cut -d: -f1)"
+    RESOLVED_GROUP="$(getent group 10001 | cut -d: -f1)"
+    if [ "$RESOLVED_USER" != "wren" ] || [ "$RESOLVED_GROUP" != "wren" ]; then
+      echo "wren cloud-init: refused - uid/gid 10001 resolved to '$RESOLVED_USER:$RESOLVED_GROUP', not wren:wren" >&2
+      exit 1
+    fi
+    echo "wren cloud-init: uid/gid 10001 confirmed to be wren:wren"
+
+  # The SECOND account, and the one that matters most: purse, uid/gid 10002. wren-purse.service
+  # (build order step 5) declares User=purse Group=purse and is the only process on this host that
+  # ever holds the hot key. Until this step it was created by nobody -- the signer would not start,
+  # wren-beat.service Requires= it and so would never run, and whoever added the account by hand
+  # would land on whatever id happened to be free. That is the uid-collision class that scrapped
+  # v1, this time on the account holding the key. Same free-then-resolved pair as 10001, for the
+  # same reason: an assumption nobody checked is what this whole rebuild exists to remove.
+  - |
+    if getent passwd 10002 >/dev/null 2>&1; then
+      echo "wren cloud-init: refused - uid 10002 already exists before the purse group/user is created" >&2
+      exit 1
+    fi
+    if getent group 10002 >/dev/null 2>&1; then
+      echo "wren cloud-init: refused - gid 10002 already exists before the purse group/user is created" >&2
+      exit 1
+    fi
+  - [ groupadd, --gid, "10002", purse ]
+  - [ useradd, --uid, "10002", --gid, "10002", --system, --no-create-home, --home-dir, /nonexistent, --shell, /usr/sbin/nologin, purse ]
+  - |
+    RESOLVED_USER="$(getent passwd 10002 | cut -d: -f1)"
+    RESOLVED_GROUP="$(getent group 10002 | cut -d: -f1)"
+    if [ "$RESOLVED_USER" != "purse" ] || [ "$RESOLVED_GROUP" != "purse" ]; then
+      echo "wren cloud-init: refused - uid/gid 10002 resolved to '$RESOLVED_USER:$RESOLVED_GROUP', not purse:purse" >&2
+      exit 1
+    fi
+    echo "wren cloud-init: uid/gid 10002 confirmed to be purse:purse"
+  # The THIRD account: ledger, uid/gid 10003. wren-ledger-purse.service is the settlement signer
+  # and holds a different key from the content purse. It is a separate account rather than a
+  # second policy on 10002 because two policies under one uid share a credential directory, and
+  # "one signer per money path" would then be a claim about argv rather than about the kernel.
+  # The settlement key can close an epoch and book the books; it can price nothing. The content
+  # key can price content and record a spend; it can settle nothing. Same free-then-resolved pair
+  # as 10001 and 10002.
+  - |
+    if getent passwd 10003 >/dev/null 2>&1; then
+      echo "wren cloud-init: refused - uid 10003 already exists before the ledger group/user is created" >&2
+      exit 1
+    fi
+    if getent group 10003 >/dev/null 2>&1; then
+      echo "wren cloud-init: refused - gid 10003 already exists before the ledger group/user is created" >&2
+      exit 1
+    fi
+  - [ groupadd, --gid, "10003", ledger ]
+  - [ useradd, --uid, "10003", --gid, "10003", --system, --no-create-home, --home-dir, /nonexistent, --shell, /usr/sbin/nologin, ledger ]
+  - |
+    RESOLVED_USER="$(getent passwd 10003 | cut -d: -f1)"
+    RESOLVED_GROUP="$(getent group 10003 | cut -d: -f1)"
+    if [ "$RESOLVED_USER" != "ledger" ] || [ "$RESOLVED_GROUP" != "ledger" ]; then
+      echo "wren cloud-init: refused - uid/gid 10003 resolved to '$RESOLVED_USER:$RESOLVED_GROUP', not ledger:ledger" >&2
+      exit 1
+    fi
+    echo "wren cloud-init: uid/gid 10003 confirmed to be ledger:ledger"
+
+  # The purse must be able to speak to the beat over its socket and no further: the socket is
+  # chmod 0660 by the purse itself and the beat runs as root, so no group membership is added
+  # here. purse is NOT in the wren group and wren is NOT in the purse group -- the model's
+  # container (uid 10001) must never be able to read anything the signer owns.
+
+  # The layout (CTO spec 3.7, and this step's own instructions). No key file is placed by any of
+  # this -- every directory below is created empty; deploy-droplet.sh --seal is the only thing
+  # that ever writes into /etc/wren/creds, and it pipes straight into systemd-creds encrypt over
+  # the live SSH session, never through a plaintext intermediate on this disk.
+  #
+  # Every path any unit names has to be here, or its parent has to be: a directory made by hand at
+  # deploy time is a mode nobody asserts, and the one that would have been made by hand is
+  # /srv/wren/keys -- the hot key's home. test/host-fixes.test.mjs walks every unit file in this
+  # package and in packages/purse/systemd and refuses if a path it names is not covered below.
+  # 0751, not the CTO spec 3.7's 0750, and the one deliberate deviation in this file. purse
+  # (uid 10002) is not in group root, and wren-purse.service runs
+  # `/usr/bin/node /srv/wren/purse/dist/server.js --policy /srv/wren/policy/...` AS purse: at
+  # 0750 root:root the signer cannot traverse /srv/wren to open its own program or its policy and
+  # the unit dies at start. o+x is traversal only -- there is no o+r, so the directory still
+  # cannot be listed by anyone but root, and every child below carries its own owner and mode.
+  - [ install, -d, -m, "0751", -o, root, -g, root, /srv/wren ]
+  - [ install, -d, -m, "0755", -o, root, -g, root, /srv/wren/bin ]
+  - [ install, -d, -m, "2770", -o, root, -g, wren, /srv/wren/runs ]
+  # runs/archive is wren-retention's destination. install(1) applies the mode literally, unlike
+  # the python makedirs the retention script also has to do at runtime, which the unit umask masks
+  # down to 0750 root:root (Security's note N8) -- created here at the mode it must actually have,
+  # so the group can read its own archived runs.
+  - [ install, -d, -m, "2770", -o, root, -g, wren, /srv/wren/runs/archive ]
+  - [ install, -d, -m, "2770", -o, root, -g, wren, /srv/wren/state ]
+  # The signer's own paths, owned by purse and unreadable by the container's uid.
+  - [ install, -d, -m, "0700", -o, purse, -g, purse, /srv/wren/keys ]
+  - [ install, -d, -m, "0750", -o, purse, -g, purse, /srv/wren/purse ]
+  - [ install, -d, -m, "0750", -o, purse, -g, purse, /srv/wren/purse/dist ]
+  - [ install, -d, -m, "0700", -o, purse, -g, purse, /var/lib/wren ]
+  - [ install, -d, -m, "0700", -o, purse, -g, purse, /var/lib/wren/audit ]
+  # The settlement signer's own audit chain and its watermark, owned by ledger and unreadable by
+  # the content purse. The watermark is the vault balance seen at the last settlement; reading it
+  # as zero would book the whole vault as one epoch's earnings, so it lives where only the
+  # settlement account can write it.
+  - [ install, -d, -m, "0700", -o, ledger, -g, ledger, /var/lib/wren-ledger ]
+  - [ install, -d, -m, "0700", -o, ledger, -g, ledger, /var/lib/wren-ledger/audit ]
+  - [ install, -d, -m, "0700", -o, ledger, -g, ledger, /var/lib/wren-ledger/state ]
+  # The dead man's own memory, and it is root's alone. wren-watchdog writes alerts.jsonl and the
+  # `degraded` marker here, and wren-alert reads them here and nowhere else. They used to live in
+  # /srv/wren/state, which is 2770 root:wren and bind-mounted read-write into the model's
+  # container as uid 10001 -- the wren group that owns it. A container that wrote a `degraded`
+  # marker with a far-future last_notified silenced the dead man watching it, permanently, and a
+  # container that created alerts.jsonl first chose the text of the Master's email (Security's N-1
+  # and N-2 on the second read of this step). 0700 root:root inside a directory owned by purse:
+  # root traverses regardless of the parent's mode, and neither purse nor wren can enter this one.
+  - [ install, -d, -m, "0700", -o, root, -g, root, /var/lib/wren/watchdog ]
+  # The policy is world-readable on purpose: it is the published rule the signer enforces, it is
+  # pinned by --policy-sha256 in wren-purse.service, and a rule nobody can read is not a rule.
+  - [ install, -d, -m, "0755", -o, root, -g, root, /srv/wren/policy ]
+  - [ install, -m, "0600", -o, root, -g, root, /dev/null, /srv/wren/image.env ]
+  # wren-purse.service names --chain /srv/wren/chain.json and reads it read-only at start, as
+  # `purse`. It was created by nothing (Security's N-6 on the second read): its parent is 0751
+  # root:root, so a step-8 placement at 0600 root:root would have made the signer refuse to start,
+  # and wren-beat.service Requires= the signer, so no beat would ever run. Created here empty at
+  # the owner and mode it must have, printed in --plan, asserted after boot. It is a PLACEHOLDER:
+  # build order step 8 writes the deployment into it, and the signer refuses to start until it
+  # parses -- which is the intended behaviour of a half-finished deploy, not a defect.
+  - [ install, -m, "0600", -o, purse, -g, purse, /dev/null, /srv/wren/chain.json ]
+  - [ install, -d, -m, "0700", -o, root, -g, root, /etc/wren ]
+  # ONE credential directory on this host, and this is it. Every unit's LoadCredentialEncrypted=,
+  # --seal's destination, the README and --plan all name /etc/wren/creds and nothing else: the
+  # split between this and /srv/wren/creds meant a sealed model key landed where the beat unit
+  # did not look, and the beat would have failed to start at every tick with the dead man
+  # reporting it as a dead host.
+  - [ install, -d, -m, "0700", -o, root, -g, root, /etc/wren/creds ]
+
+  # WHICH resolver path this host takes, pinned rather than inherited. wren-alert@.service is the
+  # dead man's last hop and it carries a RestrictAddressFamilies list; whether name resolution
+  # needs AF_UNIX (nss-resolve's varlink socket to systemd-resolved) or only glibc's own UDP path
+  # is decided by this one line, and nothing on the laptop that wrote this file can observe it.
+  # `files dns` means /etc/hosts then glibc's own DNS resolver out of /etc/resolv.conf -- no
+  # nss-resolve, no myhostname, no mdns. The post-boot check asserts this exact line (Security's
+  # requirement on the second read). ASCII only, like every other byte in this document.
+  - |
+    if grep -qE '^hosts:' /etc/nsswitch.conf; then
+      sed -i -E 's/^hosts:.*/hosts:          files dns/' /etc/nsswitch.conf
+    else
+      printf 'hosts:          files dns\n' >> /etc/nsswitch.conf
+    fi
+    if ! grep -qE '^hosts:[[:space:]]+files dns$' /etc/nsswitch.conf; then
+      echo "wren cloud-init: refused - /etc/nsswitch.conf hosts line is not 'files dns'" >&2
+      grep -E '^hosts:' /etc/nsswitch.conf >&2 || true
+      exit 1
+    fi
+    echo "wren cloud-init: /etc/nsswitch.conf pins hosts: files dns"
+
+  # unattended-upgrades, asserted rather than assumed installed (Security note N3). apt-config
+  # dump is the MERGED view of every file under apt.conf.d, so this reads what apt itself will
+  # act on, not what one file happens to say.
+  - |
+    if ! apt-config dump | grep -q '^APT::Periodic::Unattended-Upgrade "1";'; then
+      echo "wren cloud-init: refused - unattended-upgrades is installed but not enabled (APT::Periodic::Unattended-Upgrade is not \"1\")" >&2
+      apt-config dump | grep -i '^APT::Periodic' >&2 || true
+      exit 1
+    fi
+    if ! apt-config dump | grep -q '^Unattended-Upgrade::Automatic-Reboot "false";'; then
+      echo "wren cloud-init: refused - Unattended-Upgrade::Automatic-Reboot is not \"false\"; an unannounced reboot mid-beat is a false dead-man alert" >&2
+      exit 1
+    fi
+    echo "wren cloud-init: unattended-upgrades enabled, automatic reboot off"
+
+  - [ systemctl, enable, --now, docker ]
+  - [ systemctl, daemon-reload ]
+
+  # No timer is enabled here, on purpose. wren-beat.timer, wren-watchdog.timer,
+  # wren-alive.timer and wren-retention.timer are all installed by deploy-droplet.sh over SSH
+  # after this boot (systemd units are not shipped inside cloud-init so they can be versioned,
+  # tested and updated without re-provisioning the host) and enabled only by --smoke, once one
+  # real beat has proven the host works end to end. v1 enabled its timer against a home nobody
+  # had proved; this build refuses to repeat that.

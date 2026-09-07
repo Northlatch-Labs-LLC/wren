@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# Derived from packages/agent-runtime/digitalocean/bin/heron-watchdog (Heron's) at weir main bfc070e, renamed for Wren; the history in these comments is Heron's.
+# Built-by: @projectx.sui · Co-authored-by: Kaela <kaela@projectxprotocol.dev>
+#
+# The host-side dead-man check (CTO spec 2026-09-05-engineering-heron-v2-runtime-and-host.md
+# section 3.11). It decides one thing -- has a beat completed inside the 90-minute window -- and it
+# never sends anything itself: wren-watchdog.service's OnFailure=wren-alert@watchdog.service is
+# what turns a refusal into mail, so the decision keeps its own failing fixture independent of
+# whether mail can be sent at all.
+#
+# WHAT THE EXIT CODE MEANS, and it changed with the first fix round.
+#
+# It used to mean "stale". The timer runs every 15 minutes, so one stale state file sent four
+# emails an hour, for ever, to the one mailbox the Master's ruling makes the channel -- and a
+# channel that floods is a channel nobody reads (Security's A4 on step 6). It now means A NOTICE IS
+# DUE, which is the thing OnFailure= is actually deciding:
+#
+#   exit 1  - send an email now: the first time it goes stale, every 6 hours while it stays stale,
+#             and once when it recovers.
+#   exit 0  - send nothing. Either the beat is fresh, or it is stale and the desk has already been
+#             told inside the last 6 hours.
+#
+# WHERE THE SUPPRESSION MEMORY LIVES, and this changed with the second round.
+#
+# /var/lib/wren/watchdog, 0700 root:root, created by cloud-init and asserted after boot. NOT
+# /srv/wren/state, which is 2770 root:wren and bind-mounted read-write into the model's container
+# as uid 10001 -- that is the wren group, which owns that directory. Security's N-1 on the second
+# read demonstrated the consequence against this very binary: a `degraded` file whose
+# `last_notified` was a far-future integer made this script print "notice already sent" and exit 0
+# on a host that had stopped beating, for ever, with no first notice and no mail. The container
+# could disarm the dead man watching it. It cannot write here.
+#
+# Two more bounds, so a corrupted marker cannot silence the notice even where the container cannot
+# reach: a marker field that is not a run of digits is not read at all, and a `last_notified` in the
+# future is not a record of a notice that was sent -- both are treated as "never notified", which
+# makes the notice DUE rather than suppressed. SILENT_FOR can never be negative.
+#
+# The cost of the cadence, said plainly rather than buried: `systemctl status wren-watchdog` shows
+# success on a host that is degraded but already reported. The record that does not lie is on disk
+# -- the `degraded` marker with the time it went stale, and one appended line per notice in
+# alerts.jsonl -- and the laptop-side pull evaluates the same 90 minutes against the fetched file,
+# which is the half that catches "the droplet is gone entirely". A host-only watchdog cannot report
+# its own host's death.
+#
+# WREN_STATE_FILE, WREN_WATCHDOG_DIR, WREN_WATCHDOG_MAX_AGE_SECONDS and
+# WREN_WATCHDOG_REPEAT_SECONDS are overridable so the tests can run this exact binary against a
+# fixture instead of a real /srv/wren and a real /var/lib/wren.
+set -euo pipefail
+
+STATE_FILE="${WREN_STATE_FILE:-/srv/wren/state/latest.json}"
+MAX_AGE_SECONDS="${WREN_WATCHDOG_MAX_AGE_SECONDS:-5400}"      # 90 minutes (CTO 3.11 / CISO 57)
+REPEAT_SECONDS="${WREN_WATCHDOG_REPEAT_SECONDS:-21600}"       # 6 hours between repeat notices
+
+# Root-only, and deliberately not derived from STATE_FILE: deriving it is exactly how the marker
+# ended up in the directory the container can write.
+WATCHDOG_DIR="${WREN_WATCHDOG_DIR:-/var/lib/wren/watchdog}"
+ALERTS_FILE="$WATCHDOG_DIR/alerts.jsonl"
+DEGRADED_MARKER="$WATCHDOG_DIR/degraded"
+
+NOW="$(date +%s)"
+
+# One appended line per notice decision. Append-only, never rewritten: this file is the record the
+# laptop's pull reads and the reason the marker below can be removed on recovery without losing
+# anything -- the marker's own two values are copied into the line before it goes.
+append_alert() {
+  local event="$1" detail="$2" since="${3:-}"
+  local line
+  line="$(printf '{"at":%s,"at_utc":"%s","event":"%s","state_file":"%s","age_seconds":%s,"stale_since":"%s","detail":"%s"}' \
+    "$NOW" "$(date -u -r "$NOW" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$NOW" +%Y-%m-%dT%H:%M:%SZ)" \
+    "$event" "$STATE_FILE" "${AGE:-null}" "$since" "$detail")"
+  if ! printf '%s\n' "$line" >> "$ALERTS_FILE" 2>/dev/null; then
+    # Never fail the dead man because its own record could not be written; say so instead, on the
+    # stream systemd captures, and let the exit code still carry the decision.
+    echo "wren-watchdog: WARNING - could not append to $ALERTS_FILE; the notice below is not recorded" >&2
+  fi
+}
+
+write_marker() {
+  local since="$1" last_notified="$2"
+  if ! printf 'since=%s\nlast_notified=%s\n' "$since" "$last_notified" > "$DEGRADED_MARKER" 2>/dev/null; then
+    echo "wren-watchdog: WARNING - could not write $DEGRADED_MARKER; every check will report this as a first staleness and mail on every tick" >&2
+  fi
+}
+
+# A field is a run of digits or it is not a field. Anything else -- a word, a negative number, an
+# empty value, a line somebody appended -- is read as absent, which makes the notice due.
+marker_field() {
+  local raw
+  raw="$(grep -E "^$1=" "$DEGRADED_MARKER" 2>/dev/null | head -n 1 | cut -d= -f2 || true)"
+  case "$raw" in
+    "" | *[!0-9]*)
+      [ -n "$raw" ] && echo "wren-watchdog: WARNING - $DEGRADED_MARKER field '$1' is '$raw', which is not a run of digits; reading it as absent" >&2
+      return 0
+      ;;
+  esac
+  printf '%s' "$raw"
+}
+
+# --- is it stale? -----------------------------------------------------------------------------
+STALE=0
+REASON=""
+AGE=""
+if [ ! -e "$STATE_FILE" ]; then
+  STALE=1
+  REASON="$STATE_FILE does not exist; no beat has completed, or the sink was lost"
+else
+  # GNU stat (the host) and BSD stat (this laptop, for the test) disagree on flags; try both rather
+  # than assume which one is running.
+  MTIME="$(stat -c %Y "$STATE_FILE" 2>/dev/null || stat -f %m "$STATE_FILE")"
+  AGE=$((NOW - MTIME))
+  if [ "$AGE" -gt "$MAX_AGE_SECONDS" ]; then
+    STALE=1
+    REASON="$STATE_FILE is ${AGE}s old, past the ${MAX_AGE_SECONDS}s ceiling"
+  fi
+fi
+
+# --- decide, record, and let the exit code carry whether to mail --------------------------------
+if [ "$STALE" = "1" ]; then
+  if [ -f "$DEGRADED_MARKER" ]; then
+    SINCE="$(marker_field since)"
+    LAST_NOTIFIED="$(marker_field last_notified)"
+    [ -n "$SINCE" ] || SINCE="$NOW"
+    [ -n "$LAST_NOTIFIED" ] || LAST_NOTIFIED=0
+    # A notice cannot have been sent later than now. A marker that says it was is not a record of a
+    # notice; it is a marker that would suppress every future notice for as long as it says.
+    if [ "$LAST_NOTIFIED" -gt "$NOW" ]; then
+      echo "wren-watchdog: WARNING - $DEGRADED_MARKER says the last notice was sent at $LAST_NOTIFIED, which is in the future; reading it as 'never notified' and sending the notice" >&2
+      LAST_NOTIFIED=0
+    fi
+    SILENT_FOR=$((NOW - LAST_NOTIFIED))
+    [ "$SILENT_FOR" -lt 0 ] && SILENT_FOR=0
+    if [ "$SILENT_FOR" -ge "$REPEAT_SECONDS" ]; then
+      write_marker "$SINCE" "$NOW"
+      append_alert "stale-repeat" "$REASON" "$SINCE"
+      echo "wren-watchdog: refused - $REASON (still stale since $SINCE; ${SILENT_FOR}s since the last notice, repeat window ${REPEAT_SECONDS}s)" >&2
+      exit 1
+    fi
+    echo "wren-watchdog: DEGRADED, notice already sent - $REASON (stale since $SINCE; next notice in $((REPEAT_SECONDS - SILENT_FOR))s). Exiting 0 so the one mailbox is not flooded; $DEGRADED_MARKER is the record." >&2
+    exit 0
+  fi
+  write_marker "$NOW" "$NOW"
+  append_alert "stale" "$REASON" "$NOW"
+  echo "wren-watchdog: refused - $REASON" >&2
+  exit 1
+fi
+
+if [ -f "$DEGRADED_MARKER" ]; then
+  SINCE="$(marker_field since)"
+  [ -n "$SINCE" ] || SINCE="unknown"
+  append_alert "recovered" "a beat completed again; $STATE_FILE is ${AGE}s old" "$SINCE"
+  # The marker goes, and it is not a deletion of a record: its two values are inside the appended
+  # line above before this runs, and alerts.jsonl is never rewritten. The marker is a runtime flag
+  # meaning "currently degraded", and leaving it behind would make the next recovery mail again.
+  rm -f "$DEGRADED_MARKER"
+  echo "wren-watchdog: recovered - $STATE_FILE is ${AGE}s old (ceiling ${MAX_AGE_SECONDS}s); stale since $SINCE. One recovery notice is due." >&2
+  exit 1
+fi
+
+echo "wren-watchdog: ok - $STATE_FILE is ${AGE}s old (ceiling ${MAX_AGE_SECONDS}s)"
+exit 0

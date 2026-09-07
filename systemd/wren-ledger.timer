@@ -1,0 +1,35 @@
+# Built-by: @projectx.sui · Co-authored-by: Kaela <kaela@projectxprotocol.dev>
+#
+# Once a day. The soul's epoch is the CHAIN's epoch — settle_epoch aborts EEpochNotOver unless
+# ctx.epoch() has passed the one the soul opened in — and a Sui epoch is about 24 hours. Firing
+# more often would just collect aborts; firing less often would let an epoch's earnings sit
+# unbooked while the burn accrues against them.
+#
+# Enabled only after one settlement has been run by hand and its transaction read on chain.
+
+[Unit]
+Description=Wren — settle the epoch, daily
+Documentation=file:///srv/wren/purse/README.md
+
+[Timer]
+# Four times a day, not once.
+#
+# A Sui epoch does not turn at midnight and does not turn at the same time each day: on 7 September
+# 2026 epoch 1243 opened at 00:05:38 UTC, and this timer had already fired at 00:03:08 and
+# correctly reported "nothing to do". One shot a day against a boundary that drifts is a coin
+# toss, and losing it costs a whole epoch's earnings.
+#
+# Running more often is free and safe: when the epoch has not turned, `ledger-tick` reads one
+# GraphQL field, says the epoch is still open, and exits 0 having signed nothing and spent no gas.
+# The work is idempotent by the watermark, so the extra runs cost a read and nothing else.
+OnCalendar=*-*-* 00,06,12,18:00:00
+# Every citizen firing on the same second is a self-inflicted rate limit on a public fullnode.
+RandomizedDelaySec=20min
+# A settlement missed because the host was down runs at the next boot. An epoch that never closes
+# is an allowance that never resets.
+Persistent=true
+AccuracySec=5min
+Unit=wren-ledger.service
+
+[Install]
+WantedBy=timers.target

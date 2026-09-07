@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "agentAddress": "<LEDGER_ADDRESS>",
+  "outflowCeilings": [
+    {
+      "coinType": "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI",
+      "maxPerPeriod": "20000000",
+      "periodMs": 86400000
+    }
+  ],
+  "allowedTargets": [
+    "<SOUL_PACKAGE_ID>::soul::settle_epoch",
+    "<SOUL_PACKAGE_ID>::soul::book_earned",
+    "<SOUL_PACKAGE_ID>::soul::book_burned"
+  ],
+  "allowedTypeArguments": [],
+  "allowedRecipients": [
+    "<LEDGER_ADDRESS>"
+  ],
+  "allowedObjects": [
+    "<LEDGER_CAP_ID>",
+    "<SOUL_REGISTRY_ID>",
+    "<WREN_SOUL_ID>",
+    "<CLOCK_ID>"
+  ],
+  "maxGasBudgetMist": "20000000",
+  "allowedCommandKinds": [
+    "MoveCall"
+  ]
+}

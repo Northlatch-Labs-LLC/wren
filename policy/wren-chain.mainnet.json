@@ -1,0 +1,8 @@
+{
+  "network": "mainnet",
+  "grpcUrl": "https://fullnode.mainnet.sui.io:443",
+  "packageId": "0xc5c833991ed1123d70b1001c0bcdb01ec5728b09f25dfc42a0edaf16005d404d",
+  "latestPackageId": "0xdc6dbb96885ba049c5d860d0b775b9e968cf9053a227861ae006f22e352884b5",
+  "platformId": "0x3f695b2c32714e2359c4bb9515598d8dd765b216148c5b8fa818073d52b50f36",
+  "registryId": "0x1a3fb4ac25458d7524be064a2b7e1586ccd9ed09c0d5b351621e3b101e1203a0"
+}

@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# Built-by: @projectx.sui
+# Derived from packages/agent-runtime/digitalocean/bin/heron-beat at weir main bfc070e, renamed for Wren;
+# what differs: phase two is told the agent's name and the profile file it publishes under.
+#
+# One beat on the host, two phases. Runs as root under wren-beat.service (packages/purse/systemd),
+# holds no key of its own, and writes only under /srv/wren/runs, /srv/wren/state and its unit's
+# RuntimeDirectory.
+#
+# Phase one runs the model's container once, by the image id pinned in /srv/wren/image.env, with
+# the fixed flag set in /srv/wren/run-flags.txt plus this beat's own additions (named there).
+# The container's workspace is this beat's directory, runs/<beat-id>, so an intent the model
+# writes lands at runs/<beat-id>/intent.json.
+#
+# Phase two is packages/purse/bin/beat-phase2.ts, bundled and pinned by sha256 in this file: it
+# reads that intent, asks the purse over its socket, submits what comes back, and writes
+# state/latest.json on every path. This launcher then appends one line to state/beats.jsonl with
+# what the two phases did, whatever the outcome.
+#
+# The model credential. systemd decrypts it into $CREDENTIALS_DIRECTORY for the life of this unit.
+# It is copied, 0400 owned by the container's uid, into the unit's RuntimeDirectory on /run --
+# tmpfs, host-visible so the docker daemon can bind-mount it, removed by systemd when the unit
+# stops -- and never under /srv/wren. Refused outright if /run is not tmpfs.
+set -euo pipefail
+
+SRV=/srv/wren
+RUNS="$SRV/runs"
+STATE="$SRV/state"
+IMAGE_ENV="$SRV/image.env"
+RUN_FLAGS="$SRV/run-flags.txt"
+TEMPLATE="$SRV/picoclaw/config.template.json"
+CHAIN="$SRV/chain.json"
+SOCKET=/run/wren/purse.sock
+PHASE2="$SRV/purse/dist/beat-phase2.js"
+PHASE2_SHA256="<PHASE2_SHA256>"
+NODE=/opt/node22/bin/node
+# The soul this beat books its spending against, and the endpoint the cost is read from.
+#
+# Phase two reads what the submitted transaction ACTUALLY cost, off the chain, after the fact, and
+# records that against the soul's allowance. It is never estimated: an allowance is a bound on real
+# spending, and a figure nobody can check against a transaction digest measures nothing.
+#
+# All four are substituted from the committed values document. Phase two refuses three of four
+# rather than starting and booking nothing, which would leave the allowance looking untouched while
+# real money was spent against it.
+SOUL_PACKAGE_ID="<SOUL_PACKAGE_ID>"
+SOUL_ID="<WREN_SOUL_ID>"
+SOUL_VERSION="<WREN_SOUL_VERSION>"
+GRAPHQL="https://graphql.mainnet.sui.io/graphql"
+
+# The one origin statements are issued for; the purse unit carries the same value (--api-origin).
+API_ORIGIN="https://weir.social"
+AGENT_NAME="wren"
+PROFILE="$SRV/profile.json"
+CONTAINER_UID=10001
+CONTAINER_GID=10001
+# The unit's RuntimeDirectory=wren-beat. Anything else here is a launcher run outside its unit.
+CFG_ROOT="${RUNTIME_DIRECTORY:-/run/wren-beat}"
+STALE_LOCK_SECONDS=900
+
+BEAT_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+log() { echo "wren-beat[$BEAT_ID]: $*" >&2; }
+refuse() { log "refused - $*"; exit 1; }
+
+# --- preconditions: nothing below runs unless every one of these holds -----------------------
+[ -n "${CREDENTIALS_DIRECTORY:-}" ] || refuse "CREDENTIALS_DIRECTORY is unset; this runs under wren-beat.service and nowhere else"
+[ -r "$CREDENTIALS_DIRECTORY/openrouter" ] || refuse "no model credential at $CREDENTIALS_DIRECTORY/openrouter"
+[ -d "$CFG_ROOT" ] || refuse "$CFG_ROOT is not there; the unit's RuntimeDirectory=wren-beat creates it"
+[ "$(findmnt -n -o FSTYPE --target "$CFG_ROOT")" = "tmpfs" ] || refuse "$CFG_ROOT is not on tmpfs; the model credential would touch the disk in the clear"
+[ -f "$PHASE2" ] || refuse "$PHASE2 is missing; --install-beat ships it"
+if ! echo "$PHASE2_SHA256  $PHASE2" | sha256sum --check --status; then
+  refuse "$PHASE2 does not hash to the pinned $PHASE2_SHA256"
+fi
+[ -x "$NODE" ] || refuse "$NODE is missing; --install-purse installs it"
+[ -S "$SOCKET" ] || refuse "the purse socket $SOCKET is not there; wren-purse.service must be active"
+[ -f "$RUN_FLAGS" ] || refuse "$RUN_FLAGS is missing; --install-beat ships it"
+[ -f "$TEMPLATE" ] || refuse "$TEMPLATE is missing; --install-beat ships it"
+[ -f "$CHAIN" ] || refuse "$CHAIN is missing"
+[ -f "$PROFILE" ] || refuse "$PROFILE is missing; --install-beat ships it"
+
+IMAGE_ID="$(sed -n 's/^IMAGE=wren:local@//p' "$IMAGE_ENV" | head -1)"
+[[ "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] || refuse "$IMAGE_ENV carries no pinned image id"
+ACTUAL_ID="$(docker image inspect --format '{{.Id}}' wren:local 2>/dev/null || true)"
+[ "$ACTUAL_ID" = "$IMAGE_ID" ] || refuse "wren:local on this host is '${ACTUAL_ID:-absent}', not the pinned $IMAGE_ID"
+
+# --- the lock: one beat at a time, and a stale one is cleared rather than believed forever -------
+LOCK="$RUNS/.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [ -d "$LOCK" ]; then
+    AGE=$(( $(date +%s) - $(stat -c %Y "$LOCK") ))
+    if [ "$AGE" -gt "$STALE_LOCK_SECONDS" ]; then
+      log "a lock ${AGE}s old is older than any beat can be (the unit's timeout is 600s); clearing it"
+      rmdir "$LOCK" || refuse "the stale lock $LOCK could not be cleared"
+      mkdir "$LOCK" || refuse "the lock could not be taken after clearing"
+    else
+      refuse "another beat holds $LOCK (${AGE}s old)"
+    fi
+  else
+    refuse "the lock $LOCK could not be created"
+  fi
+fi
+
+CFG="$CFG_ROOT/cfg"
+cleanup() {
+  rm -rf "$CFG"
+  rmdir "$LOCK" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# --- this beat's directory: the model's workspace, writable by the container's group ----------
+BEAT_DIR="$RUNS/$BEAT_ID"
+install -d -m 2770 -o root -g wren "$BEAT_DIR"
+
+# --- the config for this beat, rendered from the shipped template -----------------------------
+rm -rf "$CFG"
+install -d -m 0700 -o root -g root "$CFG"
+python3 - "$TEMPLATE" "$CFG/config.json" "/app/runs/$BEAT_ID" <<'PY'
+import json, sys
+template, out, workspace = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = json.load(open(template))
+cfg["agents"]["defaults"]["workspace"] = workspace
+cfg["agents"]["defaults"]["model_name"] = "route-normal"
+# The adopted beat reads, decides, may write one plan file and reports; the template's eight tool
+# steps ran out before the report on three of the first five beats (2026-09-05). Twenty is the
+# budget HEARTBEAT.md names (about twelve, with room), and the beat still has the unit's timeout.
+cfg["agents"]["defaults"]["max_tool_iterations"] = 20
+# One route: the company model key over OpenRouter. The local route needs an Ollama this host
+# does not run, and a route nothing can answer is not a fallback.
+cfg["model_list"] = [m for m in cfg["model_list"] if m.get("model_name") == "route-normal"]
+if not cfg["model_list"]:
+    sys.exit("wren-beat: the template carries no route-normal entry")
+with open(out, "w") as f:
+    f.write(json.dumps(cfg, indent=2) + "\n")
+PY
+printf 'model_list:\n  route-normal:\n    api_keys:\n      - "file://openrouter.token"\n' > "$CFG/.security.yml"
+install -m 0400 -o "$CONTAINER_UID" -g "$CONTAINER_GID" "$CREDENTIALS_DIRECTORY/openrouter" "$CFG/openrouter.token"
+chown "$CONTAINER_UID:$CONTAINER_GID" "$CFG/config.json" "$CFG/.security.yml"
+chmod 0400 "$CFG/config.json" "$CFG/.security.yml"
+chown "$CONTAINER_UID:$CONTAINER_GID" "$CFG"
+chmod 0500 "$CFG"
+
+# --- phase one: the container -------------------------------------------------------------------
+FLAGS=()
+while IFS= read -r line; do
+  line="${line%%#*}"
+  line="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  [ -z "$line" ] && continue
+  read -r -a parts <<<"$line"
+  FLAGS+=("${parts[@]}")
+done < "$RUN_FLAGS"
+
+log "phase one: image $IMAGE_ID, workspace runs/$BEAT_ID"
+set +e
+docker run "${FLAGS[@]}" \
+  --mount "type=bind,source=$CFG,target=/app/config,readonly=true" \
+  -e PICOCLAW_CONFIG=/app/config/config.json \
+  -e "WEIR_AGENT_WORKSPACE=/app/runs/$BEAT_ID" \
+  -e "WEIR_AGENT_RUNS_DIR=/app/runs/$BEAT_ID" \
+  --name "wren-beat-$BEAT_ID" \
+  "$IMAGE_ID" > "$BEAT_DIR/container.log" 2>&1
+PICOCLAW_EXIT=$?
+set -e
+chgrp wren "$BEAT_DIR/container.log" 2>/dev/null || true
+log "phase one: container exited $PICOCLAW_EXIT (log runs/$BEAT_ID/container.log)"
+
+# The credential's copy goes now, before phase two, not at exit.
+rm -rf "$CFG"
+
+# --- phase two: the intent or the plan, the purse, the API, the state file -------------------------
+# The purse's address is the policy's agentAddress, read from the pinned document the purse itself
+# runs under; the API origin is the one the purse signs statements for. Both go to phase two so a
+# publish plan can be carried out; neither is a secret.
+AGENT_ADDRESS="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agentAddress"])' "$SRV/policy/wren-policy.json")"
+[[ "$AGENT_ADDRESS" =~ ^0x[0-9a-f]{64}$ ]] || refuse "the policy's agentAddress is not a full address"
+set +e
+"$NODE" "$PHASE2" --runs "$RUNS" --state "$STATE" --socket "$SOCKET" --chain "$CHAIN" --beat-id "$BEAT_ID" \
+  --api-origin "$API_ORIGIN" --address "$AGENT_ADDRESS" --agent "$AGENT_NAME" --profile-file "$PROFILE" \
+  --soul-package "$SOUL_PACKAGE_ID" --soul "$SOUL_ID" --soul-version "$SOUL_VERSION" --graphql "$GRAPHQL" 2> "$BEAT_DIR/phase2.log"
+PHASE2_EXIT=$?
+set -e
+cat "$BEAT_DIR/phase2.log" >&2 || true
+[ -f "$STATE/latest.json" ] || refuse "phase two wrote no $STATE/latest.json (exit $PHASE2_EXIT)"
+OUTCOME="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("outcome", ""))' "$STATE/latest.json")"
+
+FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '{"beatId":"%s","startedAt":"%s","finishedAt":"%s","imageId":"%s","picoclawExit":%d,"phaseTwoExit":%d,"outcome":"%s"}\n' \
+  "$BEAT_ID" "$STARTED_AT" "$FINISHED_AT" "$IMAGE_ID" "$PICOCLAW_EXIT" "$PHASE2_EXIT" "$OUTCOME" >> "$STATE/beats.jsonl"
+chgrp wren "$STATE/beats.jsonl" 2>/dev/null || true
+chmod 0640 "$STATE/beats.jsonl" 2>/dev/null || true
+
+log "done: picoclaw exit $PICOCLAW_EXIT, phase two exit $PHASE2_EXIT, outcome $OUTCOME"
+
+# A beat whose model never ran is a failed beat (OnFailure= carries it to the desk). A phase-two
+# refusal (exit 3) is a value, recorded, and the beat completed; a phase-two error (exit 1) is not.
+if [ "$PICOCLAW_EXIT" -ne 0 ]; then exit 1; fi
+case "$PHASE2_EXIT" in
+  0|3) exit 0 ;;
+  *) exit 1 ;;
+esac

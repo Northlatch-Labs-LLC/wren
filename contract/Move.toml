@@ -1,0 +1,57 @@
+[package]
+name = "northlatch_soul"
+edition = "2024"
+version = "1.0.0"
+license = "BUSL-1.1"
+
+# Northlatch Soul — the employment record of an agentic company, on chain.
+#
+# A SEPARATE package with NO package dependency on `projectx_social`, on purpose, and for the same
+# reason `agent_mind` is a separate package rather than an upgrade: an upgrade of the money package
+# changes its digest, reopens its verified state and needs the 2-of-3 UpgradeCap ceremony.
+# Employment records must be able to change — allowances move every epoch — and nothing about that
+# should be able to touch the package that holds other people's money.
+#
+# It goes one step further than `agent_mind`, which does depend on `projectx_social` for the
+# `SocialAccount` type. This package depends on neither it nor any third party, for two reasons:
+#
+#   * A dependency would fix a publish ordering between the two packages for ever, and would make
+#     an employment record unpublishable on any chain where the social package is not live.
+#   * The two objects answer different questions. `SocialAccount` says who an address IS on a
+#     network; `EmployeeSoul` says who it WORKS FOR. Pairing them is done at birth, off chain, by
+#     opening the account with the Mastercontroller as `referrer` in the same ceremony that mints
+#     the soul — recorded here in `born_by`, which is checked against nothing and claims nothing.
+#
+# ⚠️ The Sui dependency below exists ONLY to pin the framework revision, and its `rev` is a COMMIT,
+# not the `framework/mainnet` branch every example shows. Two things make it necessary:
+#
+#   * Without it, `sui 1.78.1` auto-injects revision 2a0becb2fcc6989e492981104af67f62f2c9511a for
+#     Sui and MoveStdlib. `sui-contracts` (the money package, v5 live on mainnet) is pinned to
+#     d50b78880fdacb1bbde92e6974ed71a7650c1090, which it gets by declaring SuiSystem at that
+#     commit. Two sibling packages in one repository compiling against two framework revisions is a
+#     difference nobody sees until a shared type stops matching. This package pins to the same
+#     commit as the money package, and `override = true` is what makes the explicit pin beat the
+#     injected one.
+#   * A moving branch can resolve a DIFFERENT revision of the same 0x2 framework than the one the
+#     toolchain injects, and the build then refuses with two versions of Sui.
+#
+# SuiSystem is deliberately NOT declared here: nothing in this package binds the `sui_system`
+# named address, and pinning Sui directly is enough to move MoveStdlib with it — verified by
+# reading both `rev` lines out of Move.lock after a clean build.
+#
+# The CLI prints a [NOTE] on every build advising that this dependency be removed. Do not follow
+# it. Removing the line silently reverts the framework to the injected revision and puts this
+# package back out of step with `sui-contracts`; the build keeps working, which is precisely why
+# nothing would notice.
+#
+# To bump after a toolchain upgrade: bump `sui-contracts` first, read the resolved commit from
+# `[pinned.mainnet.Sui]` in ITS Move.lock, set it here, rebuild, re-run the tests.
+
+[dependencies]
+Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "d50b78880fdacb1bbde92e6974ed71a7650c1090", override = true }
+
+[addresses]
+northlatch_soul = "0x0"
+
+[dev-addresses]
+northlatch_soul = "0x501"

@@ -1,0 +1,30 @@
+{
+  "name": "@projectx-social/purse",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "heron-purse: the one process that holds Heron's hot key. It takes a typed intent over a unix socket, builds the transaction itself, runs the policy signer's five steps, and returns a signature or a refusal. A refusal is a value.",
+  "comment": "@projectx-social/sdk is in the dependency list deliberately. The build order for step 5 named signer, policy, @mysten/sui and zod, and pointed at the agent library's builders for post/priceContent — but those builders live in @projectx-social/sdk (tx.setContentPrice), not in @projectx-social/agent, and every Reading this package handles is an SDK type returned by the signer. Re-declaring the move call shape here instead would put a second source of truth on a money path. Named rather than quietly added.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "serve": "tsx src/server.ts",
+    "verify-audit": "tsx bin/verify-audit.ts",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@mysten/sui": "2.27.1",
+    "@projectx-social/policy": "workspace:*",
+    "@projectx-social/sdk": "workspace:*",
+    "@projectx-social/signer": "workspace:*",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@projectx-social/agent": "workspace:^",
+    "esbuild": "0.28.2",
+    "tsx": "4.23.12",
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
+  },
+  "comment2": "The unit's ExecStart runs dist/server.js, so the build is not optional here the way it is in a library: the deploy builds this package on the droplet from the source tarball and systemd runs the emitted JavaScript. `tsx` is kept for the `serve` script, which is how it is run on this laptop, and for bin/."
+}

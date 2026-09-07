@@ -1,0 +1,84 @@
+# Derived from packages/purse/systemd/heron-beat.service (Heron's) at weir main bfc070e, renamed for Wren; the history in these comments is Heron's.
+# Built-by: @projectx.sui · Co-authored-by: Kaela <kaela@projectxprotocol.dev>
+#
+# One beat, in two phases. Root-owned, oneshot, holds no key.
+#
+# Phase one runs the container, which reads and writes exactly one file: runs/<beat-id>/intent.json.
+# Phase two is packages/purse/bin/beat-phase2.ts: it validates that intent, asks the purse over the
+# socket, submits what comes back, and writes state/latest.json on every path — signed, refused, no
+# intent, or a thrown error.
+#
+# The unit is root-owned and the `wren` user is not in the docker group and has no sudo: `docker run
+# -v /:/host` makes any other restriction cosmetic, so the ability to run the container is kept with
+# the timer rather than given to the account the model's workspace belongs to.
+
+[Unit]
+Description=Wren — one beat
+Documentation=file:///srv/wren/purse/README.md
+After=network-online.target docker.service wren-purse.service
+Wants=network-online.target
+Requires=docker.service wren-purse.service
+# Step 10. Referenced here and built there; the unit does not exist yet and systemd treats a missing
+# OnFailure target as a failure to start the alert, not a failure of this unit.
+OnFailure=wren-alert@%n.service
+
+[Service]
+Type=oneshot
+# Written out rather than left to the oneshot default. A beat that hangs against an unreachable
+# fullnode must end, and it must end before the next timer tick 30 minutes later — otherwise the
+# lock in beat.sh refuses the next beat and the dead man fires on a host that is merely stuck.
+TimeoutStartSec=600
+User=root
+Group=root
+
+# The model credential, decrypted for the life of this beat only and mounted into the container from
+# $CREDENTIALS_DIRECTORY. Never written to /srv/wren in the clear.
+#
+# /etc/wren/creds, not /srv/wren/creds. There is ONE sealed-credential directory on this host and
+# every unit, --seal, the README and --plan name the same one: the split meant `--seal openrouter`
+# wrote where this unit does not look, this unit failed to start at every tick, and the dead man
+# reported a live host as dead (Security's B3 on step 6).
+LoadCredentialEncrypted=openrouter:/etc/wren/creds/openrouter.cred
+
+ExecStart=/srv/wren/bin/wren-beat
+
+# ProtectSystem=strict mounts the whole hierarchy read-only except /dev, /proc and /sys; the
+# ReadWritePaths below are the exceptions carved back out of it. Without a ProtectSystem= at all,
+# ReadWritePaths carves an exception out of nothing and the unit ran as root with the filesystem
+# writable while the comment above claimed otherwise (Security's A8 on step 6).
+ProtectSystem=strict
+
+# Phase one's output (runs/<beat-id>/intent.json and the beat log) and the sink phase two writes.
+# These two, and nothing else.
+#
+# /run/docker.sock is deliberately NOT listed, and the reason is worth writing down because it is
+# the one place strict could plausibly break this unit. ProtectSystem=strict makes /run read-only,
+# and this unit must connect() to the daemon's socket to start the container. The kernel's
+# read-only check (sb_permission) returns EROFS for regular files, directories and symlinks only;
+# a socket inode is exempt, so connecting to a unix socket on a read-only mount succeeds. Reasoned
+# from that rule, NOT observed -- there is no Debian host on the laptop this was written on. If
+# the smoke beat of build order step 9 cannot reach the daemon, the fix is one line,
+# `ReadWritePaths=... /run/docker.sock`, and the smoke beat is exactly the gate that would catch
+# it: it fails loudly, before any timer is enabled.
+#
+# What the socket means either way is said plainly: a process that can talk to it can run
+# `docker run -v /:/host` and undo every other line in this file. That is why this unit is
+# root-owned and the `wren` account the model's container runs as has neither sudo nor the docker
+# group -- the ability to launch a beat lives with the timer, never with the workspace.
+ReadWritePaths=/srv/wren/runs /srv/wren/state
+# /run/wren-beat: where the launcher renders this beat's config and places the model credential's
+# copy for the container to read, on the host's tmpfs so the docker daemon can bind-mount it.
+# Created for the unit, removed by systemd when it stops.
+RuntimeDirectory=wren-beat
+RuntimeDirectoryMode=0750
+
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0027
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

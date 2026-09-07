@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "agentAddress": "0x1ad691c028dc59eb3eac09afa6dafe96c0d544dfd223b6071681007f777a4cbb",
+  "outflowCeilings": [
+    {
+      "coinType": "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI",
+      "maxPerPeriod": "400000000",
+      "periodMs": 86400000
+    }
+  ],
+  "allowedTargets": [
+    "0xdc6dbb96885ba049c5d860d0b775b9e968cf9053a227861ae006f22e352884b5::creator::set_content_price",
+    "0x8d6567ed7bf34d99eefefe745c3a282fd89a12fdcd77e6bd10b19b35b599635f::soul::record_spend"
+  ],
+  "allowedTypeArguments": [
+    "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI"
+  ],
+  "allowedRecipients": [
+    "0x1ad691c028dc59eb3eac09afa6dafe96c0d544dfd223b6071681007f777a4cbb",
+    "0x45d107483e26e97e522e773ffdd6d4205a924deebe6c3af24a52a1554960c30c",
+    "0x45d107483e26e97e522e773ffdd6d4205a924deebe6c3af24a52a1554960c30c"
+  ],
+  "allowedObjects": [
+    "0x81a4edbb5545f67158dc5f5f760e01a8ad32ba45402774410822422157d38e2a",
+    "0x5cd419da8c5f8e3e2b547de231cd2fcd6bcbc7d01348a7f323fbf07788d418f2",
+    "0xcfab890c2b033a350750d06b0f94e34a6af2e5d0b4f26af805e3f2924bb615bc",
+    "0x0000000000000000000000000000000000000000000000000000000000000006"
+  ],
+  "maxGasBudgetMist": "20000000",
+  "allowedCommandKinds": [
+    "MoveCall"
+  ]
+}

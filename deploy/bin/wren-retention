@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+# Derived from packages/agent-runtime/digitalocean/bin/heron-retention (Heron's) at weir main bfc070e, renamed for Wren; the history in these comments is Heron's.
+"""Built-by: @projectx.sui · Co-authored-by: Kaela <kaela@projectxprotocol.dev>
+
+Bounds /srv/wren/runs. Heron v1's logrotate config rotated nothing (CTO spec
+2026-09-05-engineering-heron-v2-runtime-and-host.md section 1, cause 8b): each beat writes a NEW
+timestamped file, `rotate 4` rotates each file once, and the files themselves accumulate forever
+on a 10 GB disk at 48 beats a day.
+
+THE UNIT OF RETENTION IS THE BEAT, not the file. Phase one of a two-phase beat writes a DIRECTORY
+per beat -- runs/<beat-id>/, holding intent.json and the beat's log -- and this script used to
+consider only plain files sitting directly under runs/. It walked past every one of those
+directories, 48 a day, unbounded, on a 10 GB disk: v1's defect 8b in a new shape (Security's A7 on
+step 6). An entry below is therefore either a plain file or a whole beat directory, and both are
+counted, weighed and archived the same way.
+
+This keeps the newest N entries (default 200) and a byte ceiling (default 512 MiB) under the runs
+directory by moving the OLDEST entries first into runs/archive/ -- a file gzip-compressed, a
+directory as one .tar.gz of the whole tree -- never deleting.
+
+The estate's law is never delete, archive. Nothing here removes anything that has not already been
+written, compressed, into archive/ -- and in the directory case the archive is read back and its
+file count compared against the tree before the tree goes. There is no `rotate` here and no path
+that removes bytes which do not exist somewhere else first.
+
+The archive directory is not itself bounded by this script, on purpose: the archive is meant to
+grow until an operator reads it, and a script that also capped the archive would be quietly
+deleting under a different name. The honest limit, stated rather than solved: a droplet with a
+full disk is itself an alert condition this script cannot prevent, only delay by moving bytes
+into a smaller (compressed) form -- see the disk-usage warning below, which is advisory only and
+never fails the run.
+
+WREN_RUNS_DIR, WREN_RETENTION_KEEP and WREN_RETENTION_CEILING_BYTES are overridable so
+test/host.test.mjs and test/host-fixes.test.mjs can run this exact binary against a fixture.
+
+Usage: wren-retention
+"""
+import gzip
+import grp
+import os
+import shutil
+import sys
+import tarfile
+
+RUNS_DIR = os.environ.get("WREN_RUNS_DIR", "/srv/wren/runs")
+ARCHIVE_DIR_NAME = "archive"
+KEEP = int(os.environ.get("WREN_RETENTION_KEEP", "200"))
+CEILING_BYTES = int(os.environ.get("WREN_RETENTION_CEILING_BYTES", str(512 * 1024 * 1024)))
+
+
+def archive_dir() -> str:
+    return os.path.join(RUNS_DIR, ARCHIVE_DIR_NAME)
+
+
+def entry_size(path: str) -> int:
+    """Bytes for a plain file, or the sum of every file under a beat directory."""
+    if os.path.isfile(path):
+        return os.stat(path).st_size
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.stat(os.path.join(root, name)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def entry_mtime(path: str) -> float:
+    """Newest mtime anywhere in the entry.
+
+    A beat directory's own mtime stops moving once the last file is created inside it, so a
+    directory still being written to can look older than a file written after it. Taking the
+    newest mtime in the tree means the sort orders by "when this beat last did anything", which is
+    what "oldest first" has to mean if a live beat is never to be archived out from under itself.
+    """
+    newest = os.stat(path).st_mtime
+    if os.path.isdir(path):
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                try:
+                    newest = max(newest, os.stat(os.path.join(root, name)).st_mtime)
+                except OSError:
+                    continue
+    return newest
+
+
+def live_entries() -> list[tuple[float, int, str]]:
+    """(mtime, size, path) for every file AND every beat directory directly under RUNS_DIR,
+    excluding archive/ itself."""
+    entries = []
+    for name in os.listdir(RUNS_DIR):
+        if name == ARCHIVE_DIR_NAME:
+            continue
+        path = os.path.join(RUNS_DIR, name)
+        if not (os.path.isfile(path) or os.path.isdir(path)):
+            continue
+        if os.path.islink(path):
+            # A symlink is followed by nothing here: archiving through one would move bytes that
+            # live somewhere this script was never pointed at.
+            continue
+        entries.append((entry_mtime(path), entry_size(path), path))
+    entries.sort(key=lambda entry: entry[0])  # oldest first
+    return entries
+
+
+def archive_one(path: str) -> None:
+    """Moves one entry into archive/, compressed. A file becomes <name>.gz; a beat directory
+    becomes <name>.tar.gz of the whole tree.
+
+    The original is removed only AFTER the compressed copy exists and has been verified to hold
+    every file that was in the tree. That ordering is the whole difference between archiving and
+    deleting, and it is why the directory case reads the archive back before it removes anything.
+    """
+    name = os.path.basename(path)
+
+    if os.path.isfile(path):
+        if name.endswith(".gz"):
+            shutil.move(path, os.path.join(archive_dir(), name))
+            return
+        dest = os.path.join(archive_dir(), name + ".gz")
+        with open(path, "rb") as source, gzip.open(dest, "wb") as sink:
+            shutil.copyfileobj(source, sink)
+        os.remove(path)
+        return
+
+    # A beat directory.
+    dest = os.path.join(archive_dir(), name + ".tar.gz")
+    expected = sum(len(files) for _root, _dirs, files in os.walk(path))
+    with tarfile.open(dest, "w:gz") as archive:
+        archive.add(path, arcname=name)
+
+    with tarfile.open(dest, "r:gz") as archive:
+        members = [member for member in archive.getmembers() if member.isfile()]
+    if len(members) != expected:
+        raise RuntimeError(
+            f"{dest} holds {len(members)} files but {path} has {expected}; "
+            "the original is left exactly where it is"
+        )
+
+    # Verified. The bytes are in archive/ and readable, so the tree goes -- this is the one
+    # rmtree in this file and it is unreachable until the two lines above have both passed.
+    shutil.rmtree(path)
+
+
+def warn_if_disk_nearly_full() -> None:
+    """Advisory only. Never fails the run -- see the module docstring's honest limit."""
+    try:
+        usage = shutil.disk_usage(RUNS_DIR)
+    except OSError:
+        return
+    if usage.total > 0 and (usage.used / usage.total) > 0.90:
+        print(
+            f"wren-retention: WARNING - the filesystem under {RUNS_DIR} is over 90% full "
+            "(archiving moves bytes into a smaller form; it does not create space that isn't "
+            "there, and a full disk is itself an alert condition, not something this script "
+            "can fix)",
+            file=sys.stderr,
+        )
+
+
+def ensure_archive_dir() -> None:
+    """Creates archive/ at 2770 root:wren, and MEANS it.
+
+    `os.makedirs(mode=0o2770)` is masked by the process umask, so under the unit's UMask this
+    landed 0750 root:root and the wren group could not read its own archived runs (Security's
+    note N8). chmod is not masked. cloud-init also creates this directory at the right mode, so on
+    a real host this is the second of two belts; on a fixture it is the only one.
+    """
+    os.makedirs(archive_dir(), exist_ok=True)
+    try:
+        os.chmod(archive_dir(), 0o2770)
+    except OSError as exc:
+        print(f"wren-retention: WARNING - could not chmod {archive_dir()} to 2770: {exc}", file=sys.stderr)
+    if os.geteuid() != 0:
+        return
+    try:
+        os.chown(archive_dir(), 0, grp.getgrnam("wren").gr_gid)
+    except (KeyError, OSError) as exc:
+        print(f"wren-retention: WARNING - could not chown {archive_dir()} to root:wren: {exc}", file=sys.stderr)
+
+
+def main() -> int:
+    ensure_archive_dir()
+
+    entries = live_entries()
+    count = len(entries)
+    total_bytes = sum(size for _, size, _ in entries)
+    archived = 0
+
+    for _mtime, size, path in entries:
+        if count <= KEEP and total_bytes <= CEILING_BYTES:
+            break
+        archive_one(path)
+        archived += 1
+        count -= 1
+        total_bytes -= size
+
+    warn_if_disk_nearly_full()
+
+    print(
+        f"wren-retention: kept {count} entr(ies) ({total_bytes} bytes) under {RUNS_DIR}, "
+        f"archived {archived} into {archive_dir()}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
