@@ -218,6 +218,45 @@ export const bookBurnedIntent = z.strictObject({
   amountMist: positiveU64,
 });
 
+/**
+ * The whole settlement, as one transaction.
+ *
+ * `book_earned`, `book_burned` and `settle_epoch` were three separate intents, signed and
+ * submitted one after another. On 2026-09-07 the first landed and the second was refused, and the
+ * repaired run booked the income a second time because nothing on chain or on disk told it the
+ * first attempt had already succeeded. Her `earned_total` is permanently double as a result, and
+ * `book_earned` only adds — there is no correction in the module and none under `MasterCap`.
+ *
+ * A retry of a partially-completed sequence is the whole problem, and it does not go away by
+ * retrying more carefully. It goes away when there is no partial state to resume from: all three
+ * calls in one programmable transaction block either land together or none of them does.
+ *
+ * Two properties this does NOT weaken, checked before it was written:
+ *
+ *   - `move-call-target` iterates EVERY MoveCall in the transaction, and `command-kind` iterates
+ *     every command kind. Three calls are checked three times against the same allow-list; one
+ *     transaction is not one check.
+ *   - The capability is read once and used three times WITHIN the block. Sui resolves object
+ *     versions per transaction, not per command, so the staleness that broke the sequential
+ *     version cannot arise inside a single block at all.
+ *
+ * `bookEarnedMist` and `bookBurnedMist` are optional because a settlement legitimately has
+ * nothing to book on one side or the other — a zero booking is a call that says nothing, and the
+ * builder omits it rather than sending a no-op.
+ */
+export const settleAtomicIntent = z.strictObject({
+  kind: z.literal('settle_atomic'),
+  packageId: suiId,
+  ledgerCap: ownedObjectRef,
+  registry: sharedObjectRef,
+  soul: sharedObjectRef,
+  clock: sharedObjectRef,
+  bookEarnedMist: positiveU64.optional(),
+  bookBurnedMist: positiveU64.optional(),
+  vaultSui: u64,
+  epochNetNonneg: z.boolean(),
+});
+
 export const intentSchema = z.discriminatedUnion('kind', [
   postIntent,
   priceIntent,
@@ -225,6 +264,7 @@ export const intentSchema = z.discriminatedUnion('kind', [
   recordSpendIntent,
   bookEarnedIntent,
   bookBurnedIntent,
+  settleAtomicIntent,
   // A personal-message signature over one of two texts the SDK builds; see statement.ts.
   statementIntent,
 ]);

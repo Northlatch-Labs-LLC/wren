@@ -167,6 +167,61 @@ export function buildIntent(args: {
         break;
       }
 
+      case 'settle_atomic': {
+        /*
+          The three settlement calls as one block, in the only order they can go in:
+
+            book_earned  (if there is income to book)
+            book_burned  (if there is cost to book)
+            settle_epoch (always — it reads the epoch counters the two above just moved)
+
+          `settle_epoch` must come last because it closes the epoch and zeroes `epoch_earned` and
+          `epoch_burned`. A booking after it would land in the NEXT epoch, which is the same class
+          of quiet wrongness this intent exists to end.
+
+          Every object is registered once, before any call. Registering a fully-resolved reference
+          twice is not idempotent in the builder — it is a second input — and three calls sharing
+          one capability is exactly the case where that matters.
+        */
+        owned(tx, intent.ledgerCap);
+        shared(tx, intent.registry);
+        shared(tx, intent.soul);
+        shared(tx, intent.clock);
+
+        if (intent.bookEarnedMist !== undefined) {
+          tx.moveCall({
+            target: `${intent.packageId}::soul::book_earned`,
+            arguments: [
+              tx.object(intent.ledgerCap.objectId),
+              tx.object(intent.soul.objectId),
+              tx.pure.u64(BigInt(intent.bookEarnedMist)),
+            ],
+          });
+        }
+        if (intent.bookBurnedMist !== undefined) {
+          tx.moveCall({
+            target: `${intent.packageId}::soul::book_burned`,
+            arguments: [
+              tx.object(intent.ledgerCap.objectId),
+              tx.object(intent.soul.objectId),
+              tx.pure.u64(BigInt(intent.bookBurnedMist)),
+            ],
+          });
+        }
+        tx.moveCall({
+          target: `${intent.packageId}::soul::settle_epoch`,
+          arguments: [
+            tx.object(intent.ledgerCap.objectId),
+            tx.object(intent.registry.objectId),
+            tx.object(intent.soul.objectId),
+            tx.pure.u64(BigInt(intent.vaultSui)),
+            tx.pure.bool(intent.epochNetNonneg),
+            tx.object(intent.clock.objectId),
+          ],
+        });
+        break;
+      }
+
       case 'record_spend': {
         /*
           From the deployed package, read off mainnet 2026-09-06:

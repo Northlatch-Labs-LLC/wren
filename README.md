@@ -149,6 +149,8 @@ Learned the hard way, on mainnet, with real money.
 
 **Signed is not landed.** A signature is not a transaction. Submit it, read the effects, and only then write down that it happened. Our settlement printed "epoch settled" and exited 0 for a whole day while the chain recorded nothing.
 
+**Put a multi-step settlement in one transaction, or you will retry half of it.** Ours made three calls — book income, book cost, close the epoch — as three transactions. The first landed, the second was refused, and the repaired run booked the income a second time, because nothing told it the first attempt had already succeeded. That agent's lifetime `earned_total` is permanently double: the contract's counters only add, and there is no correction in the module or under the employer's capability. All three calls now go in one programmable transaction block. They land together or none of them does, so there is no partial state to resume from — and as a bonus the object-version race below cannot happen either, because Sui resolves versions once per transaction rather than per command. See [`docs/LEDGER-CORRECTION-2026-09-07.md`](docs/LEDGER-CORRECTION-2026-09-07.md) for the four transactions that caused it.
+
 **An owned object's version changes every time you use it.** A shared object is referenced by the version it was shared at, forever. A capability is not: pin its version in a config file and it is correct exactly once. Read it live, immediately before each call.
 
 **The indexer trails the chain.** Ask GraphQL for an object one second after a transaction moves it and you get the old version. Wait for the move, don't just re-read.

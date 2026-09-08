@@ -80,6 +80,74 @@ describe('a price intent', () => {
   });
 });
 
+describe('a settle_atomic intent puts the whole settlement in one transaction', () => {
+  /*
+    The three calls were three transactions until 2026-09-07, when the first landed, the second was
+    refused, and the repaired run booked the income a second time. `earned_total` is permanently
+    double: `book_earned` only adds and the module has no correction, not even under MasterCap.
+
+    These tests pin the two properties that make the atomic form correct rather than merely
+    convenient — that all three calls are in ONE transaction, and that `settle_epoch` is LAST.
+    Order is not cosmetic here: `settle_epoch` zeroes `epoch_earned` and `epoch_burned`, so a
+    booking after it lands in the next epoch and is invisible in the one it belonged to.
+  */
+  const SOUL_PACKAGE = `0x${'9'.repeat(64)}`;
+  const LEDGER_CAP = `0x${'a'.repeat(64)}`;
+  const REGISTRY = `0x${'b'.repeat(64)}`;
+  const SOUL = `0x${'c'.repeat(64)}`;
+
+  const base = {
+    kind: 'settle_atomic' as const,
+    packageId: SOUL_PACKAGE,
+    ledgerCap: { objectId: LEDGER_CAP, version: '2', digest: '11111111111111111111111111111111' },
+    registry: { objectId: REGISTRY, initialSharedVersion: '1', mutable: true },
+    soul: { objectId: SOUL, initialSharedVersion: '1', mutable: true },
+    clock: { objectId: '0x6', initialSharedVersion: '1', mutable: false },
+    vaultSui: '5000000000',
+    epochNetNonneg: true,
+  };
+
+  const targets = (intent: unknown): string[] =>
+    build(intent).commands.map((c) => {
+      const m = c.MoveCall!;
+      return `${m.module}::${m.function}`;
+    });
+
+  it('is one transaction carrying book_earned, book_burned and settle_epoch, in that order', () => {
+    expect(targets({ ...base, bookEarnedMist: '1000', bookBurnedMist: '500' })).toEqual([
+      'soul::book_earned',
+      'soul::book_burned',
+      'soul::settle_epoch',
+    ]);
+  });
+
+  it('omits a booking with nothing to book, and still settles last', () => {
+    expect(targets({ ...base, bookBurnedMist: '500' })).toEqual([
+      'soul::book_burned',
+      'soul::settle_epoch',
+    ]);
+    expect(targets({ ...base, bookEarnedMist: '1000' })).toEqual([
+      'soul::book_earned',
+      'soul::settle_epoch',
+    ]);
+    expect(targets(base)).toEqual(['soul::settle_epoch']);
+  });
+
+  it('settle_epoch is never anything but the last command', () => {
+    for (const extra of [{}, { bookEarnedMist: '1' }, { bookBurnedMist: '1' }, { bookEarnedMist: '1', bookBurnedMist: '2' }]) {
+      const list = targets({ ...base, ...extra });
+      expect(list[list.length - 1]).toBe('soul::settle_epoch');
+      expect(list.filter((t) => t === 'soul::settle_epoch')).toHaveLength(1);
+    }
+  });
+
+  it('registers the capability once, however many calls use it', () => {
+    const data = build({ ...base, bookEarnedMist: '1000', bookBurnedMist: '500' });
+    const capInputs = data.inputs.filter((i) => i.Object?.ImmOrOwnedObject?.objectId === LEDGER_CAP);
+    expect(capInputs).toHaveLength(1);
+  });
+});
+
 describe('a settle_epoch intent', () => {
   /*
     There is no TypeScript client for the soul package anywhere in the estate (the CTO's F1). The

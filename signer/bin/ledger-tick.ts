@@ -247,72 +247,11 @@ const soulRef = {
 };
 
 /*
-  Every ask in order. A refusal anywhere stops the rest: a half-booked epoch must not be settled.
+  Submit the signed bytes and read the digest out of whichever envelope the node used.
 
-  The intent is composed by a function rather than held as a value, because each call moves the
-  capability and the next one has to see where it moved to.
-*/
-type Cap = { objectId: string; version: string; digest: string };
-const asks: { readonly what: string; readonly intent: (cap: Cap) => unknown }[] = [];
-if (plan.bookEarnedMist > 0n) {
-  asks.push({
-    what: 'book_earned',
-    intent: (cap) => ({
-      kind: 'book_earned',
-      packageId,
-      ledgerCap: cap,
-      soul: soulRef,
-      amountMist: String(plan.bookEarnedMist),
-    }),
-  });
-}
-if (plan.bookBurnedMist > 0n) {
-  asks.push({
-    what: 'book_burned',
-    intent: (cap) => ({
-      kind: 'book_burned',
-      packageId,
-      ledgerCap: cap,
-      soul: soulRef,
-      amountMist: String(plan.bookBurnedMist),
-    }),
-  });
-}
-asks.push({
-  what: 'settle_epoch',
-  intent: (cap) => ({
-    kind: 'settle_epoch',
-    packageId,
-    ledgerCap: cap,
-    registry: {
-      objectId: values.get('--registry')!,
-      initialSharedVersion: values.get('--registry-version')!,
-      mutable: true,
-    },
-    soul: soulRef,
-    clock: {
-      objectId: values.get('--clock')!,
-      initialSharedVersion: values.get('--clock-version')!,
-      mutable: false,
-    },
-    vaultSui: String(plan.vaultSui),
-    epochNetNonneg: plan.epochNetNonneg,
-  }),
-});
-
-const socketPath = values.get('--socket')!;
-
-/*
-  Signed is not settled.
-
-  This loop used to ask the purse for a signature, print "<what> signed.", and move on. Nothing
-  submitted the signed bytes to anything. On 2026-09-07 at 03:34 it signed `book_earned`,
-  `book_burned` and `settle_epoch`, printed "epoch settled", wrote its watermark and exited 0 —
-  and the chain recorded none of it. The settlement account had never sent a transaction in its
-  life. `bin/beat-phase2.ts` had a submit port from the day it was written; this file never did.
-
-  So: submit, read the effects, and treat anything but SUCCESS as a failure. The three envelope
-  shapes are the same three `packages/agent/src/tx.ts` reads, for the same reason it reads them.
+  Three shapes, because `packages/agent/src/tx.ts` reads three and this file once read two — the
+  one it did not read, `Transaction` with a capital T, is the one the node actually returns. That
+  cost a priced post its body on 2026-09-07: the transaction landed and the client threw.
 */
 const client = createClient(chain.value);
 
@@ -331,41 +270,81 @@ async function submitSigned(txBytesB64: string, signature: string): Promise<stri
   return digest;
 }
 
-const landed: string[] = [];
-/** The cap version this settlement has already spent. Null until the first call lands. */
-let usedVersion: string | null = null;
-for (const ask of asks) {
-  const cap: Cap = usedVersion === null ? ledgerCap : await liveLedgerCap(usedVersion);
-  const answer = await askPurse({ socketPath, intent: ask.intent(cap) });
-  if (!answer.ok) {
-    console.error(`${prefix}: ${ask.what} — ${answer.refused.reason}`);
-    process.exit(3);
-  }
-  if (!answer.value.ok) {
-    console.error(`${prefix}: ${ask.what} refused — ${JSON.stringify(answer.value)}`);
-    process.exit(3);
-  }
-  const signed = answer.value as { ok: true; txBytesB64: string; signature: string };
-  let digest: string;
-  try {
-    digest = await submitSigned(signed.txBytesB64, signed.signature);
-  } catch (thrown) {
-    /*
-      Exit 1, not 3. A refusal is the policy saying no and nothing being sent; this is a
-      transaction that may well be on chain. The watermark below is not written, so the next run
-      recomputes the whole settlement from the chain rather than skipping it.
-    */
-    console.error(
-      `${prefix}: ${ask.what} was signed and the submit threw: ` +
-        `${thrown instanceof Error ? thrown.message : String(thrown)} ` +
-        `Nothing has been recorded as settled. Check the chain before running this again.`,
-    );
-    process.exit(1);
-  }
-  usedVersion = cap.version;
-  landed.push(`${ask.what}=${digest}`);
-  console.log(`${prefix}: ${ask.what} landed ${digest}`);
+/*
+  ONE transaction, not three.
+
+  This used to build three intents and submit them one after another. On 2026-09-07 the first
+  landed and the second was refused, and the repaired run booked the income again because nothing
+  told it the first attempt had already succeeded. `earned_total` is permanently double as a
+  result: `book_earned` only adds, and the module has no correction, not even under MasterCap.
+
+  Retrying half a finished sequence is the fault, and no amount of care in the retry removes it.
+  What removes it is having no partial state to resume from. All three calls now go in one
+  programmable transaction block: they land together or nothing lands, and a run that fails leaves
+  the soul exactly as it found it.
+
+  It also dissolves the bug that caused the failure. The capability's version changed with every
+  call, so each sequential call had to re-read it and race the indexer. Sui resolves object
+  versions once per transaction, not per command, so three calls in one block share one resolution
+  and the staleness cannot occur.
+*/
+const cap = firstCap;
+
+const intent = {
+  kind: 'settle_atomic',
+  packageId,
+  ledgerCap: cap,
+  registry: {
+    objectId: values.get('--registry')!,
+    initialSharedVersion: values.get('--registry-version')!,
+    mutable: true,
+  },
+  soul: soulRef,
+  clock: {
+    objectId: values.get('--clock')!,
+    initialSharedVersion: values.get('--clock-version')!,
+    mutable: false,
+  },
+  ...(plan.bookEarnedMist > 0n ? { bookEarnedMist: String(plan.bookEarnedMist) } : {}),
+  ...(plan.bookBurnedMist > 0n ? { bookBurnedMist: String(plan.bookBurnedMist) } : {}),
+  vaultSui: String(plan.vaultSui),
+  epochNetNonneg: plan.epochNetNonneg,
+};
+
+const socketPath = values.get('--socket')!;
+
+const answer = await askPurse({ socketPath, intent });
+if (!answer.ok) {
+  console.error(`${prefix}: the settlement — ${answer.refused.reason}`);
+  process.exit(3);
 }
+if (!answer.value.ok) {
+  console.error(`${prefix}: the settlement refused — ${JSON.stringify(answer.value)}`);
+  process.exit(3);
+}
+
+const signed = answer.value as { ok: true; txBytesB64: string; signature: string };
+let digest: string;
+try {
+  digest = await submitSigned(signed.txBytesB64, signed.signature);
+} catch (thrown) {
+  /*
+    Exit 1, not 3. A refusal is the policy saying no with nothing sent; this is a transaction that
+    may be on chain. No watermark is written, so the next run recomputes from the chain — and
+    because the block is atomic, "may be on chain" now means the WHOLE settlement either happened
+    or did not. There is no half to reason about.
+  */
+  console.error(
+    `${prefix}: the settlement was signed and the submit threw: ` +
+      `${thrown instanceof Error ? thrown.message : String(thrown)} ` +
+      `Nothing has been recorded as settled. Check the chain before running this again.`,
+  );
+  process.exit(1);
+}
+console.log(
+  `${prefix}: settled in one transaction ${digest}` +
+    ` — earned ${String(plan.bookEarnedMist)} burned ${String(plan.bookBurnedMist)}`,
+);
 
 /*
   Written only after all three transactions LANDED, not merely after they were signed.
@@ -381,5 +360,5 @@ await writeFile(
   `${JSON.stringify({ lastSeenEarningsMist: String(plan.vaultSui), settledAtEpoch: String(epoch.value) }, null, 2)}\n`,
   'utf8',
 );
-console.log(`${prefix}: epoch settled — ${landed.join(' ')}`);
+console.log(`${prefix}: epoch settled.`);
 process.exit(0);
