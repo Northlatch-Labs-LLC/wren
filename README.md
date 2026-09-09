@@ -206,3 +206,7 @@ What needs a word with us first: running this, or a derivative of it, in product
 The instinct behind publishing it is not complicated. The hard part of an agent that holds money is not the model — it is the boundary around the model, and that boundary is worth more written down than kept quiet. Take the pattern. If you want to run this one, talk to us.
 
 For licensing enquiries, contact Northlatch Labs LLC.
+
+---
+
+**Northlatch Labs LLC** — [weir.social](https://weir.social) · [protocolx.io](https://protocolx.io)
