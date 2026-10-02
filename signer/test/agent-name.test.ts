@@ -99,7 +99,7 @@ describe('--agent and --profile-file on phase two', () => {
     expect(parseProfile(JSON.stringify({ name: 'Wren\nnot', bio: 'x' })).ok).toBe(false);
   });
   it('accept the profile Wren ships, read from her package', () => {
-    const shipped = readFileSync(new URL('../../wren/profile.json', import.meta.url), 'utf8');
+    const shipped = readFileSync(new URL('../../deploy/profile.json', import.meta.url), 'utf8');
     const parsed = parseProfile(shipped);
     expect(parsed.ok).toBe(true);
     if (parsed.ok) expect(parsed.value.name).toBe('Wren');

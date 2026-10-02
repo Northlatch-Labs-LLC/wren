@@ -76,7 +76,7 @@ import { directive, parseUnit } from '../src/units.js';
 import { CHAIN, PACKAGE, temporaryDirectory } from './helpers.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const UNIT = join(HERE, '..', 'systemd', 'heron-purse.service');
+const UNIT = join(HERE, '..', '..', 'systemd', 'wren-purse.service');
 
 /** `createClient` as the compiled artefact, which is what `dist/server.js` imports on the droplet. */
 const SDK_ENTRY = pathToFileURL(
@@ -195,7 +195,7 @@ async function runUnderUnitFlags(): Promise<Run> {
   const present = await exists(interpreter);
   const runtime = present ? interpreter : process.execPath;
 
-  const dir = await temporaryDirectory('heron-purse-smoke-');
+  const dir = await temporaryDirectory('wren-purse-smoke-');
   const childPath = join(dir, 'construct-client.mjs');
   await writeFile(childPath, CHILD, 'utf8');
 

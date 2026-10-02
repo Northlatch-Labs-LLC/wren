@@ -63,26 +63,26 @@ import {
   throwawayKeypair,
 } from './helpers.js';
 
-const POLICY_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'policy');
+const POLICY_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'policy');
 
 const GAS = fixedGas({
   price: 1000n,
   payment: [{ objectId: GAS_COIN_ID, version: '1', digest: '11111111111111111111111111111111' }],
 });
 
-/** The substitutions `digitalocean/deploy.sh` fills. Fixture values stand in for them here. */
+/** The substitutions `deploy/deploy-droplet.sh` fills. Fixture values stand in for them here. */
 function rendered(text: string, agentAddress: string): string {
   return text
-    .replaceAll('<HERON_ADDRESS>', agentAddress)
+    .replaceAll('<WREN_ADDRESS>', agentAddress)
     .replaceAll('<LEDGER_ADDRESS>', agentAddress)
     .replaceAll('<OPERATOR_ADDRESS>', `0x${'d'.repeat(64)}`)
     .replaceAll('<TREASURY_ADDRESS>', `0x${'e'.repeat(64)}`)
-    .replaceAll('<HERON_VAULT_ID>', `0x${'1'.repeat(64)}`)
-    .replaceAll('<HERON_CREATOR_CAP_ID>', `0x${'2'.repeat(64)}`)
+    .replaceAll('<WREN_VAULT_ID>', `0x${'1'.repeat(64)}`)
+    .replaceAll('<WREN_CREATOR_CAP_ID>', `0x${'2'.repeat(64)}`)
     .replaceAll('<SOUL_PACKAGE_ID>', SOUL_PACKAGE)
     .replaceAll('<LEDGER_CAP_ID>', LEDGER_CAP_ID)
     .replaceAll('<SOUL_REGISTRY_ID>', REGISTRY_ID)
-    .replaceAll('<HERON_SOUL_ID>', SOUL_ID)
+    .replaceAll('<WREN_SOUL_ID>', SOUL_ID)
     .replaceAll('<CLOCK_ID>', CLOCK_ID);
 }
 
@@ -141,10 +141,10 @@ function throwaway(): string {
   return address;
 }
 
-describe('policy/heron-content.json — the content arm', () => {
+describe('policy/wren-content.json — the content arm', () => {
   it('refuses a well-formed settle_epoch, by target', async () => {
     const address = throwaway();
-    const policy = await shipped('heron-content.json', address);
+    const policy = await shipped('wren-content.json', address);
     const h = await purseOver(policy, settleEpochResponse(address), address);
 
     const response = await h.purse.handle({ intent: settleEpochIntentFor() });
@@ -158,7 +158,7 @@ describe('policy/heron-content.json — the content arm', () => {
 
   it('names three recipients, SUI only, and the 0.4 SUI epoch ceiling', async () => {
     const address = throwaway();
-    const policy = await shipped('heron-content.json', address);
+    const policy = await shipped('wren-content.json', address);
 
     expect(policy.allowedRecipients).toHaveLength(3);
     expect(policy.allowedRecipients[0]).toBe(address);
@@ -169,7 +169,7 @@ describe('policy/heron-content.json — the content arm', () => {
   });
 
   it('allows the post and price entry and record_spend, and nothing else', async () => {
-    const policy = await shipped('heron-content.json', throwaway());
+    const policy = await shipped('wren-content.json', throwaway());
     expect(policy.allowedTargets).toHaveLength(2);
     expect(policy.allowedTargets.some((t) => t.endsWith('::creator::set_content_price'))).toBe(true);
     expect(policy.allowedTargets.some((t) => t.endsWith('::soul::record_spend'))).toBe(true);
@@ -177,17 +177,17 @@ describe('policy/heron-content.json — the content arm', () => {
   });
 
   it('pins the package on every target — no bare module::function', async () => {
-    const policy = await shipped('heron-content.json', throwaway());
+    const policy = await shipped('wren-content.json', throwaway());
     for (const target of policy.allowedTargets) {
       expect(target).toMatch(/^0x[0-9a-f]{1,64}::[a-z_]+::[a-z_]+$/);
     }
   });
 });
 
-describe('policy/heron-ledger.json — the LedgerCap service', () => {
+describe('policy/wren-ledger.json — the LedgerCap service', () => {
   it('refuses a price intent, by target', async () => {
     const address = throwaway();
-    const policy = await shipped('heron-ledger.json', address);
+    const policy = await shipped('wren-ledger.json', address);
     const h = await purseOver(policy, setPriceResponse(address), address);
 
     const response = await h.purse.handle({ intent: priceIntentFor() });
@@ -200,7 +200,7 @@ describe('policy/heron-ledger.json — the LedgerCap service', () => {
 
   it('refuses a post intent, by target', async () => {
     const address = throwaway();
-    const policy = await shipped('heron-ledger.json', address);
+    const policy = await shipped('wren-ledger.json', address);
     const h = await purseOver(policy, setPriceResponse(address), address);
 
     const response = await h.purse.handle({ intent: postIntentFor() });
@@ -212,7 +212,7 @@ describe('policy/heron-ledger.json — the LedgerCap service', () => {
   });
 
   it('names the three LedgerCap calls and nothing else', async () => {
-    const policy = await shipped('heron-ledger.json', throwaway());
+    const policy = await shipped('wren-ledger.json', throwaway());
     expect(policy.allowedTargets).toEqual([
       SETTLE_EPOCH,
       SETTLE_EPOCH.replace('::settle_epoch', '::book_earned'),
@@ -293,18 +293,20 @@ describe('one signer per money path', () => {
   });
 });
 
-describe('policy/heron-multisig.json, the committed members document', () => {
+describe('policy/wren-multisig.json, the committed members document', () => {
   /*
-    Heron's real members: the hot key born 2026-09-05 and the brake key read from the chain. The
-    address is what the SDK derives from them, computed here rather than restated, and compared to
-    the one written in the estate's records so the document and the records cannot drift apart.
+    Wren's real members: the hot key and the brake key. The address is what the SDK derives from
+    them, computed here rather than restated, and compared to the one written in the shipped
+    records (policy/wren-values.json, README.md) so the document and the records cannot drift
+    apart. The individual key addresses are what the committed keys derive to and are asserted
+    for the same reason: a swapped member fails loudly here before anything else notices.
   */
-  const HERON_ADDRESS = '0xe8345fea67b57baf5461446852c4badeb8936e2af7cc390fc5c16be0337ddd70';
-  const HOT_ADDRESS = '0x51704a474f342e9f50a408f8be090b05ae73b17b98a0f8f7597abb62ec4310b0';
-  const BRAKE_ADDRESS = '0x4668e5bf1dfd48129d6037d027c344577163f9685389be1f43a8a8e9ce726c9a';
+  const WREN_ADDRESS = '0x1ad691c028dc59eb3eac09afa6dafe96c0d544dfd223b6071681007f777a4cbb';
+  const HOT_ADDRESS = '0xaa6f2ec4e3e372efd3c576c56219b5f32772831502f81a23793a9deeb56dcfdd';
+  const BRAKE_ADDRESS = '0x7c8efe2a96dfbaa58aa81e0d812aff14924a81889bd649322b7e14ae00169908';
 
   it('loads through the real loader, has two members at weight 1 and threshold 1', async () => {
-    const loaded = await loadMultisigDoc(join(POLICY_DIR, 'heron-multisig.json'));
+    const loaded = await loadMultisigDoc(join(POLICY_DIR, 'wren-multisig.json'));
     expect(loaded.ok).toBe(true);
     if (!loaded.ok) throw new Error('unreachable');
     expect(loaded.value.doc.threshold).toBe(1);
@@ -312,7 +314,7 @@ describe('policy/heron-multisig.json, the committed members document', () => {
   });
 
   it('derives the address the records name, from the members the records name', async () => {
-    const loaded = await loadMultisigDoc(join(POLICY_DIR, 'heron-multisig.json'));
+    const loaded = await loadMultisigDoc(join(POLICY_DIR, 'wren-multisig.json'));
     if (!loaded.ok) throw new Error(loaded.refused.reason);
     const keys = loaded.value.doc.members.map((m) => publicKeyFromSuiBytes(m.publicKey));
     expect(keys[0]!.toSuiAddress()).toBe(HOT_ADDRESS);
@@ -321,121 +323,69 @@ describe('policy/heron-multisig.json, the committed members document', () => {
       threshold: loaded.value.doc.threshold,
       publicKeys: loaded.value.doc.members.map((m, i) => ({ publicKey: keys[i]!, weight: m.weight })),
     });
-    expect(derived.toSuiAddress()).toBe(HERON_ADDRESS);
+    expect(derived.toSuiAddress()).toBe(WREN_ADDRESS);
+    // The same address, read from the shipped values document rather than restated here.
+    const values = JSON.parse(await readFile(join(POLICY_DIR, 'wren-values.json'), 'utf8')) as Record<string, string>;
+    expect(values.WREN_ADDRESS).toBe(WREN_ADDRESS);
   });
 });
 
-describe('policy/heron-content-pre-soul.json, the document the purse runs under before the soul exists', () => {
-  const HERON_ADDRESS = '0xe8345fea67b57baf5461446852c4badeb8936e2af7cc390fc5c16be0337ddd70';
+/*
+  No pre-soul describe block: the weir monorepo shipped heron-content-pre-soul.json, the document
+  Heron's purse ran under before her soul was published. This repository ships no such artifact —
+  Wren was born after the soul contract was live, and policy/ carries only the template, the
+  values and the rendered mainnet documents. The behavioural claim the block made (a document
+  with an empty allowedObjects signs nothing, refused at the object-input rule) is covered for
+  any document by purse.test.ts and beat.test.ts, so nothing here depends on an unshipped file.
+*/
 
-  it('loads through the real pinned loader with no substitution left in it', async () => {
-    const path = join(POLICY_DIR, 'heron-content-pre-soul.json');
-    const text = await readFile(path, 'utf8');
-    expect(text).not.toContain('<');
-    const loaded = await loadPinnedPolicy({ path, expectedSha256: createHash('sha256').update(text, 'utf8').digest('hex') });
-    expect(loaded.ok).toBe(true);
-    if (!loaded.ok) throw new Error(loaded.refused.reason);
-    expect(loaded.value.doc.agentAddress).toBe(HERON_ADDRESS);
-    expect(loaded.value.doc.allowedObjects).toEqual([]);
-    expect(loaded.value.doc.allowedRecipients).toEqual([HERON_ADDRESS]);
-  });
-
-  it('refuses a price intent at the object allowlist, so a purse under it signs nothing until the vault exists', async () => {
-    const path = join(POLICY_DIR, 'heron-content-pre-soul.json');
-    const text = await readFile(path, 'utf8');
-    const loaded = await loadPinnedPolicy({ path, expectedSha256: createHash('sha256').update(text, 'utf8').digest('hex') });
-    if (!loaded.ok) throw new Error(loaded.refused.reason);
-    const dir = await temporaryDirectory();
-    const audit = await AuditFile.open(join(dir, 'audit.jsonl'));
-    if (!audit.ok) throw new Error(audit.reason);
-    const ledger = await SpendLedger.open({ path: join(dir, 'spend.jsonl'), policy: loaded.value.doc });
-    if (!ledger.ok) throw new Error(ledger.reason);
-    // The signer stands in for the multisig; only the address matters to the policy.
-    const signer = { ...signerFor(throwawayKeypair()), address: HERON_ADDRESS };
-    const response = setPriceResponse(HERON_ADDRESS);
-    // The real v5 package, so the built target matches the document's and the refusal is the
-    // objects rule's, not the target rule's.
-    const V5 = '0xdc6dbb96885ba049c5d860d0b775b9e968cf9053a227861ae006f22e352884b5';
-    const purse: Purse = createPurse({
-      signer,
-      policy: loaded.value.doc,
-      policyHash: loaded.value.policyHash,
-      policyFileSha256: loaded.value.fileSha256,
-      chain: { ...CHAIN, latestPackageId: V5 },
-      client: stubClient(response),
-      audit: audit.file,
-      ledger: ledger.ledger,
-      gas: GAS,
-      simulation: stubPort(response, HERON_ADDRESS),
-      log: () => undefined,
-    });
-    const answered = await purse.handle({ intent: priceIntentFor() });
-    expect(answered.ok).toBe(false);
-    if (answered.ok) throw new Error('unreachable');
-    // The recorded simulation calls the fixture package, so under the document as committed the
-    // target rule speaks first. The claim under test is the EMPTY object list: with the fixture's
-    // target admitted and nothing else changed, the refusal is the objects rule's.
-    expect(answered.refused.ruleId).toBe('move-call-target');
-    const targetAdmitted: Purse = createPurse({
-      signer,
-      policy: { ...loaded.value.doc, allowedTargets: [SET_CONTENT_PRICE] },
-      policyHash: loaded.value.policyHash,
-      policyFileSha256: loaded.value.fileSha256,
-      chain: CHAIN,
-      client: stubClient(response),
-      audit: audit.file,
-      ledger: ledger.ledger,
-      gas: GAS,
-      simulation: stubPort(response, HERON_ADDRESS),
-      log: () => undefined,
-    });
-    const objectsRefused = await targetAdmitted.handle({ intent: priceIntentFor() });
-    expect(objectsRefused.ok).toBe(false);
-    if (objectsRefused.ok) throw new Error('unreachable');
-    expect(objectsRefused.refused.ruleId).toBe('object-input');
-    await audit.file.close();
-  });
-});
-
-describe('policy/heron-chain.mainnet.json, the chain document the purse reads on the host', () => {
-  it('loads through the real loader and names the packages Published.toml records', async () => {
+describe('policy/wren-chain.mainnet.json, the chain document the purse reads on the host', () => {
+  /*
+    The monorepo cross-checked this against sui-contracts/Published.toml, the money package's
+    publish record. That artifact is not part of this repository — contract/ is the soul package,
+    not the projectx_social package the purse calls into — so what is asserted here is the
+    document as committed: it loads through the real loader, it is mainnet, and the ids are the
+    ones this estate actually runs against.
+  */
+  it('loads through the real loader and names the packages the values document records', async () => {
     const { loadChainConfig } = await import('../src/chain.js');
-    const loaded = await loadChainConfig(join(POLICY_DIR, 'heron-chain.mainnet.json'));
+    const loaded = await loadChainConfig(join(POLICY_DIR, 'wren-chain.mainnet.json'));
     expect(loaded.ok).toBe(true);
     if (!loaded.ok) throw new Error(loaded.refused.reason);
     expect(loaded.value.network).toBe('mainnet');
-    const published = await readFile(join(POLICY_DIR, '..', '..', '..', 'sui-contracts', 'Published.toml'), 'utf8');
-    const publishedAt = /published-at = "(0x[0-9a-f]+)"/.exec(published)?.[1];
-    const originalId = /original-id = "(0x[0-9a-f]+)"/.exec(published)?.[1];
-    expect(loaded.value.latestPackageId).toBe(publishedAt);
-    expect(loaded.value.packageId).toBe(originalId);
+    expect(loaded.value.latestPackageId).toBe('0xdc6dbb96885ba049c5d860d0b775b9e968cf9053a227861ae006f22e352884b5');
+    expect(loaded.value.packageId).toBe('0xc5c833991ed1123d70b1001c0bcdb01ec5728b09f25dfc42a0edaf16005d404d');
     // The platform and registry are the shared objects the original package's publish transaction
-    // created (DbB4fSp7GV9C2UTRWe2T7f8G7ddT8fo4QjnnBtLddpct, read from mainnet 2026-09-05).
+    // created (read from mainnet 2026-09-05).
     expect(loaded.value.platformId).toBe('0x3f695b2c32714e2359c4bb9515598d8dd765b216148c5b8fa818073d52b50f36');
     expect(loaded.value.registryId).toBe('0x1a3fb4ac25458d7524be064a2b7e1586ccd9ed09c0d5b351621e3b101e1203a0');
   });
 });
 
-describe('policy/heron-content.mainnet.json, the rendered content policy the purse runs under once the vault exists', () => {
-  it('equals the render of the template with the committed values, pre-soul, and loads through the pinned loader', async () => {
+describe('policy/wren-content.mainnet.json, the rendered content policy the purse runs under once the vault exists', () => {
+  it('equals the render of the template with the committed values, soul rows included, and loads through the pinned loader', async () => {
     const { renderPolicy } = await import('../bin/render-policy.js');
-    const template = await readFile(join(POLICY_DIR, 'heron-content.json'), 'utf8');
-    const values = JSON.parse(await readFile(join(POLICY_DIR, 'heron-values.json'), 'utf8')) as Record<string, string>;
-    const rendered = renderPolicy(template, values, true);
+    const template = await readFile(join(POLICY_DIR, 'wren-content.json'), 'utf8');
+    const values = JSON.parse(await readFile(join(POLICY_DIR, 'wren-values.json'), 'utf8')) as Record<string, string>;
+    const rendered = renderPolicy(template, values, false);
     expect(rendered.ok).toBe(true);
     if (!rendered.ok) throw new Error(rendered.reason);
-    const committed = await readFile(join(POLICY_DIR, 'heron-content.mainnet.json'), 'utf8');
+    const committed = await readFile(join(POLICY_DIR, 'wren-content.mainnet.json'), 'utf8');
     expect(committed).toBe(rendered.text);
-    const loaded = await loadPinnedPolicy({ path: join(POLICY_DIR, 'heron-content.mainnet.json'), expectedSha256: createHash('sha256').update(committed, 'utf8').digest('hex') });
+    const loaded = await loadPinnedPolicy({ path: join(POLICY_DIR, 'wren-content.mainnet.json'), expectedSha256: createHash('sha256').update(committed, 'utf8').digest('hex') });
     expect(loaded.ok).toBe(true);
     if (!loaded.ok) throw new Error(loaded.refused.reason);
-    expect(loaded.value.doc.agentAddress).toBe('0xe8345fea67b57baf5461446852c4badeb8936e2af7cc390fc5c16be0337ddd70');
+    expect(loaded.value.doc.agentAddress).toBe('0x1ad691c028dc59eb3eac09afa6dafe96c0d544dfd223b6071681007f777a4cbb');
     expect(loaded.value.doc.allowedObjects).toEqual([
-      '0x0c3f3a6174293544f3ac61e466d9ebe62edb88cca2f3674cbd9311df8e736b68',
-      '0xea9ba87eb3a50e9113bc08aba8a4fb227d28371335ebcab43a235c316357d0d0',
+      '0x81a4edbb5545f67158dc5f5f760e01a8ad32ba45402774410822422157d38e2a',
+      '0x5cd419da8c5f8e3e2b547de231cd2fcd6bcbc7d01348a7f323fbf07788d418f2',
+      '0xcfab890c2b033a350750d06b0f94e34a6af2e5d0b4f26af805e3f2924bb615bc',
       '0x0000000000000000000000000000000000000000000000000000000000000006',
     ]);
-    expect(loaded.value.doc.allowedTargets).toEqual(['0xdc6dbb96885ba049c5d860d0b775b9e968cf9053a227861ae006f22e352884b5::creator::set_content_price']);
+    expect(loaded.value.doc.allowedTargets).toEqual([
+      '0xdc6dbb96885ba049c5d860d0b775b9e968cf9053a227861ae006f22e352884b5::creator::set_content_price',
+      '0x8d6567ed7bf34d99eefefe745c3a282fd89a12fdcd77e6bd10b19b35b599635f::soul::record_spend',
+    ]);
   });
 });
 

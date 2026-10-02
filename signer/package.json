@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "heron-purse: the one process that holds Heron's hot key. It takes a typed intent over a unix socket, builds the transaction itself, runs the policy signer's five steps, and returns a signature or a refusal. A refusal is a value.",
+  "description": "wren-purse: the one process that holds Wren's hot key. It takes a typed intent over a unix socket, builds the transaction itself, runs the policy signer's five steps, and returns a signature or a refusal. A refusal is a value.",
   "comment": "@projectx-social/sdk is in the dependency list deliberately. The build order for step 5 named signer, policy, @mysten/sui and zod, and pointed at the agent library's builders for post/priceContent — but those builders live in @projectx-social/sdk (tx.setContentPrice), not in @projectx-social/agent, and every Reading this package handles is an SDK type returned by the signer. Re-declaring the move call shape here instead would put a second source of truth on a money path. Named rather than quietly added.",
   "scripts": {
     "typecheck": "tsc --noEmit",
@@ -14,13 +14,14 @@
   },
   "dependencies": {
     "@mysten/sui": "2.27.1",
-    "@projectx-social/policy": "workspace:*",
-    "@projectx-social/sdk": "workspace:*",
-    "@projectx-social/signer": "workspace:*",
+    "@projectx-social/policy": "1.0.1",
+    "@projectx-social/sdk": "1.0.1",
+    "@projectx-social/signer": "1.0.1",
     "zod": "4.5.4"
   },
   "devDependencies": {
-    "@projectx-social/agent": "workspace:^",
+    "@projectx-social/agent": "1.0.1",
+    "@types/node": "22.16.0",
     "esbuild": "0.28.2",
     "tsx": "4.23.12",
     "typescript": "7.0.2",

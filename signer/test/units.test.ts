@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { directive, onlyValue, parseUnit, type ParsedUnit } from '../src/units.js';
 
-const SYSTEMD = join(dirname(fileURLToPath(import.meta.url)), '..', 'systemd');
+const SYSTEMD = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'systemd');
 
 async function unit(name: string): Promise<ParsedUnit> {
   return parseUnit(await readFile(join(SYSTEMD, name), 'utf8'));
@@ -24,38 +24,38 @@ async function text(name: string): Promise<string> {
   return readFile(join(SYSTEMD, name), 'utf8');
 }
 
-describe('heron-purse.service', () => {
+describe('wren-purse.service', () => {
   it('runs as the purse user and takes the key as an encrypted systemd credential', async () => {
-    const purse = await unit('heron-purse.service');
+    const purse = await unit('wren-purse.service');
     expect(onlyValue(purse, 'Service', 'User')).toBe('purse');
     expect(directive(purse, 'Service', 'LoadCredentialEncrypted')).toContain(
-      'heron-hot:/etc/heron/creds/heron-hot.cred',
+      'wren-hot:/etc/wren/creds/wren-hot.cred',
     );
   });
 
   /*
     A5 from Security's review of 2026-09-05: `User=purse` named no uid, and v1's defect 3 was a
     dynamically allocated uid colliding with a platform account. The ruling the build log records is
-    `heron` 10001 and `purse` 10002, both asserted free before they are created.
+    `wren` 10001 and `purse` 10002, both asserted free before they are created.
 
     systemd has no directive that carries a uid alongside a user name, so the ruling lives in the
     unit's header comment — which is precisely the kind of text this test file exists to stop being
-    decorative. The numbers are asserted here and in the README so the deploy has one place to copy
+    decorative. The numbers are asserted here so the deploy has one place to copy
     from and drift fails a test rather than a droplet.
   */
   it('runs as purse:purse and names the uid the deploy must create', async () => {
-    const purse = await unit('heron-purse.service');
+    const purse = await unit('wren-purse.service');
     expect(onlyValue(purse, 'Service', 'User')).toBe('purse');
     expect(onlyValue(purse, 'Service', 'Group')).toBe('purse');
 
-    const raw = await text('heron-purse.service');
+    const raw = await text('wren-purse.service');
     expect(raw).toContain('--uid 10002');
     expect(raw).toContain('getent passwd 10002');
     expect(raw).toContain('10001');
   });
 
   it('carries the hardening set the CISO named', async () => {
-    const purse = await unit('heron-purse.service');
+    const purse = await unit('wren-purse.service');
     expect(onlyValue(purse, 'Service', 'NoNewPrivileges')).toBe('yes');
     expect(onlyValue(purse, 'Service', 'ProtectSystem')).toBe('strict');
     expect(onlyValue(purse, 'Service', 'ProtectHome')).toBe('yes');
@@ -98,7 +98,7 @@ describe('heron-purse.service', () => {
       test no longer pretends it can. `client-smoke.test.ts` answers it, by starting a real node
       with whatever flags this ExecStart carries and building the real client in it.
     */
-    const purse = await unit('heron-purse.service');
+    const purse = await unit('wren-purse.service');
     const denies = onlyValue(purse, 'Service', 'MemoryDenyWriteExecute') === 'yes';
     const exec = directive(purse, 'Service', 'ExecStart').join(' ');
     const jitless = exec.includes('--jitless');
@@ -111,20 +111,20 @@ describe('heron-purse.service', () => {
   });
 
   it('passes the policy path and a pin, and never a key path in argv', async () => {
-    const purse = await unit('heron-purse.service');
+    const purse = await unit('wren-purse.service');
     const exec = directive(purse, 'Service', 'ExecStart').join(' ');
     expect(exec).toContain('--policy ');
     expect(exec).toContain('--policy-sha256 ');
-    expect(exec).toContain('--socket /run/heron/purse.sock');
+    expect(exec).toContain('--socket /run/wren/purse.sock');
     // No --key-file: the key comes from the credential directory, which the unit declares above.
     expect(exec).not.toContain('--key-file');
   });
 
   it('pins the compiled server and the members document by sha256 before the process starts, and runs node 22 from /opt', async () => {
-    const purse = await unit('heron-purse.service');
+    const purse = await unit('wren-purse.service');
     const pres = directive(purse, 'Service', 'ExecStartPre');
-    expect(pres.some((line) => line.includes('<DIST_SHA256>') && line.includes('/srv/heron/purse/dist/server.js') && line.includes('sha256sum --check'))).toBe(true);
-    expect(pres.some((line) => line.includes('<MULTISIG_SHA256>') && line.includes('/srv/heron/policy/heron-multisig.json') && line.includes('sha256sum --check'))).toBe(true);
+    expect(pres.some((line) => line.includes('<DIST_SHA256>') && line.includes('/srv/wren/purse/dist/server.js') && line.includes('sha256sum --check'))).toBe(true);
+    expect(pres.some((line) => line.includes('<MULTISIG_SHA256>') && line.includes('/srv/wren/policy/wren-multisig.json') && line.includes('sha256sum --check'))).toBe(true);
     const exec = directive(purse, 'Service', 'ExecStart').join(' ');
     /*
       The interpreter and the script are pinned; what is between them is not. Node's own flags are
@@ -132,76 +132,82 @@ describe('heron-purse.service', () => {
       the second place that made removing it fail the suite.
     */
     expect(exec.startsWith('/opt/node22/bin/node ')).toBe(true);
-    expect(exec).toContain(' /srv/heron/purse/dist/server.js ');
-    expect(exec.split(' /srv/heron/purse/dist/server.js ')[0]).not.toContain('.js');
+    expect(exec).toContain(' /srv/wren/purse/dist/server.js ');
+    expect(exec.split(' /srv/wren/purse/dist/server.js ')[0]).not.toContain('.js');
     // systemd expands %-specifiers in Exec lines (%s is the user's shell); a pin line must not use one.
     for (const line of pres) expect(line).not.toMatch(/%[a-zA-Z%]/);
   });
 
   it('turns statements on for one origin with a daily ceiling, both flags together', async () => {
-    const purse = await unit('heron-purse.service');
+    const purse = await unit('wren-purse.service');
     const exec = directive(purse, 'Service', 'ExecStart').join(' ');
     expect(exec).toContain('--api-origin https://weir.social');
     expect(exec).toMatch(/--statements-per-day [1-9][0-9]{0,3}\b/);
     // Two statements a beat at most (name once, then publish) at 48 beats a day.
     expect(exec).toContain('--statements-per-day 96');
-    expect(exec).toContain('--vault 0x0c3f3a6174293544f3ac61e466d9ebe62edb88cca2f3674cbd9311df8e736b68');
+    // The vault id is the deploy's to fill (<VAULT_ID>); what is pinned here is that the flag is
+    // carried at all — a purse that forgets --vault signs statements against no vault.
+    expect(exec).toContain('--vault <VAULT_ID>');
   });
 
-  it("passes the multisig document, so the purse signs as Heron's 1-of-2 address and not as the hot key", async () => {
-    const purse = await unit('heron-purse.service');
+  it("passes the multisig document, so the purse signs as Wren's 1-of-2 address and not as the hot key", async () => {
+    const purse = await unit('wren-purse.service');
     const exec = directive(purse, 'Service', 'ExecStart').join(' ');
-    expect(exec).toContain('--multisig /srv/heron/policy/heron-multisig.json');
+    expect(exec).toContain('--multisig /srv/wren/policy/wren-multisig.json');
   });
 
   it('the beat unit carries a RuntimeDirectory on tmpfs for the per-beat config, beside its two ReadWritePaths', async () => {
-    const beat = await unit('heron-beat.service');
-    expect(onlyValue(beat, 'Service', 'RuntimeDirectory')).toBe('heron-beat');
+    const beat = await unit('wren-beat.service');
+    expect(onlyValue(beat, 'Service', 'RuntimeDirectory')).toBe('wren-beat');
     expect(onlyValue(beat, 'Service', 'RuntimeDirectoryMode')).toBe('0750');
-    expect(onlyValue(beat, 'Service', 'ReadWritePaths')).toBe('/srv/heron/runs /srv/heron/state');
+    expect(onlyValue(beat, 'Service', 'ReadWritePaths')).toBe('/srv/wren/runs /srv/wren/state');
   });
 
-  it('is Type=notify, so After=heron-purse.service means the socket exists', async () => {
-    const purse = await unit('heron-purse.service');
+  it('is Type=notify, so After=wren-purse.service means the socket exists', async () => {
+    const purse = await unit('wren-purse.service');
     expect(onlyValue(purse, 'Service', 'Type')).toBe('notify');
     expect(onlyValue(purse, 'Service', 'NotifyAccess')).toBe('all');
   });
 });
 
-describe('heron-beat.service', () => {
+describe('wren-beat.service', () => {
   it('is a root-owned oneshot with an explicit timeout and an alert on failure', async () => {
-    const beat = await unit('heron-beat.service');
+    const beat = await unit('wren-beat.service');
     expect(onlyValue(beat, 'Service', 'Type')).toBe('oneshot');
     expect(onlyValue(beat, 'Service', 'User')).toBe('root');
     expect(onlyValue(beat, 'Service', 'TimeoutStartSec')).toBe('600');
-    expect(onlyValue(beat, 'Unit', 'OnFailure')).toBe('heron-alert@%n.service');
+    expect(onlyValue(beat, 'Unit', 'OnFailure')).toBe('wren-alert@%n.service');
   });
 
   it('starts after the purse, so the first beat after a reboot does not race the socket', async () => {
-    const beat = await unit('heron-beat.service');
-    expect(directive(beat, 'Unit', 'After').join(' ')).toContain('heron-purse.service');
+    const beat = await unit('wren-beat.service');
+    expect(directive(beat, 'Unit', 'After').join(' ')).toContain('wren-purse.service');
   });
 
   it('can write only the runs and state directories', async () => {
-    const beat = await unit('heron-beat.service');
-    expect(onlyValue(beat, 'Service', 'ReadWritePaths')).toBe('/srv/heron/runs /srv/heron/state');
+    const beat = await unit('wren-beat.service');
+    expect(onlyValue(beat, 'Service', 'ReadWritePaths')).toBe('/srv/wren/runs /srv/wren/state');
   });
 });
 
 describe('the uid ruling', () => {
-  it('is the same in the unit and in the README, so the deploy has one source', async () => {
-    const raw = await text('heron-purse.service');
-    const readme = await readFile(join(SYSTEMD, '..', 'README.md'), 'utf8');
+  /*
+    In the weir monorepo this was cross-checked against packages/purse/README.md, which carried the
+    deploy's uid table. In this repo the extracted README.md is a project overview with no deploy
+    detail — the unit's own comment block is the one place the deploy copies the ruling from, so
+    that is what is asserted. The numbers themselves are unchanged from the monorepo's.
+  */
+  it('is written in the unit, so the deploy has one source', async () => {
+    const raw = await text('wren-purse.service');
     for (const fact of ['10001', '10002', 'getent passwd 10002', '--uid 10002']) {
       expect(raw).toContain(fact);
-      expect(readme).toContain(fact);
     }
   });
 });
 
-describe('heron-beat.timer', () => {
+describe('wren-beat.timer', () => {
   it('fires every thirty minutes and catches up after a reboot', async () => {
-    const timer = await unit('heron-beat.timer');
+    const timer = await unit('wren-beat.timer');
     expect(onlyValue(timer, 'Timer', 'OnUnitActiveSec')).toBe('30min');
     expect(onlyValue(timer, 'Timer', 'Persistent')).toBe('true');
   });

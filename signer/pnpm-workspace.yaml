@@ -1,0 +1,4 @@
+# pnpm 12 records build-script approvals here; without this a fresh
+# `pnpm install` exits 1 on esbuild postinstall.
+allowBuilds:
+  esbuild: true
