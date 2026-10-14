@@ -347,7 +347,47 @@ console.log(
 );
 
 /*
-  Written only after all three transactions LANDED, not merely after they were signed.
+  Invariant: settle_epoch zeroes epoch_earned and epoch_burned in the same PTB.
+
+  Re-reading the soul immediately after the digest confirms the transaction did what we asked.
+  epoch_earned and epoch_burned must both be zero — if either is non-zero, the on-chain state
+  does not match the settlement we issued, which is a critical inconsistency. Halt rather than
+  watermark a state we cannot verify.
+
+  This read may be slightly stale if the indexer has not caught up; the retry loop gives it
+  three chances before giving up. The soul is a shared object and the PTB is the only writer
+  of epoch_earned / epoch_burned within a single epoch, so a non-zero read after confirmation
+  is either a stale index or a logic error — either way the watermark must not move.
+*/
+const soulId = values.get('--soul')!;
+let postSoul = await readSoul(endpoint, soulId);
+for (
+  let retry = 0;
+  retry < 2 && !(postSoul.ok && postSoul.value.epochEarned === 0n && postSoul.value.epochBurned === 0n);
+  retry += 1
+) {
+  await new Promise((resolve) => setTimeout(resolve, 2_000));
+  postSoul = await readSoul(endpoint, soulId);
+}
+if (!postSoul.ok) {
+  console.error(
+    `${prefix}: settlement landed (${digest}) but the post-settlement soul read failed: ` +
+      `${postSoul.refused.reason} — watermark not written; verify the chain before re-running.`,
+  );
+  process.exit(1);
+}
+if (postSoul.value.epochEarned !== 0n || postSoul.value.epochBurned !== 0n) {
+  console.error(
+    `${prefix}: settlement landed (${digest}) but the soul still shows non-zero epoch counters ` +
+      `after 3 reads — epoch_earned=${String(postSoul.value.epochEarned)} ` +
+      `epoch_burned=${String(postSoul.value.epochBurned)}. ` +
+      `Watermark not written; this is a critical invariant violation requiring manual review.`,
+  );
+  process.exit(1);
+}
+
+/*
+  Written only after all three transactions LANDED and the post-settlement invariant confirmed.
 
   The earlier version wrote it after signing. On 2026-09-07 that moved the watermark to 0.9697 SUI
   for a settlement that never reached the chain, so the next run would have seen a zero delta and
