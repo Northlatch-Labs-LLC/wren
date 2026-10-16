@@ -18,6 +18,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: "Provide /opt/node22 (the interpreter the unit names)"
+        run: |
+          cd /tmp
+          curl -fsSLO https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz
+          curl -fsSLO https://nodejs.org/dist/v22.23.2/SHASUMS256.txt
+          grep ' node-v22.23.2-linux-x64.tar.xz$' SHASUMS256.txt | sha256sum -c -
+          sudo mkdir -p /opt/node22
+          sudo tar -xJf node-v22.23.2-linux-x64.tar.xz --strip-components=1 -C /opt/node22
+          /opt/node22/bin/node --version
       - name: Install
         run: pnpm install --frozen-lockfile
       - name: "Gate: typecheck"
